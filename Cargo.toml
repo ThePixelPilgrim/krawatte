@@ -2,6 +2,9 @@
 name = "krawatte"
 version = "0.1.0"
 edition = "2024"
+description = "Full-screen terminal multi-tail: run several programs, follow their output interleaved or per pane, shut them all down with one Ctrl-C"
+license = "MIT"
+repository = "https://github.com/ThePixelPilgrim/krawatte"
 
 [dependencies]
 ansi-to-tui = "8.0.1"
