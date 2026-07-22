@@ -67,7 +67,7 @@ the UI never leaves a raw terminal or orphaned children.
 ### Keybindings
 | Key | Action |
 |---|---|
-| `Tab` / `Shift-Tab` | cycle to next / previous single pane |
+| `Tab` / `Shift-Tab` | cycle forward / backward through all-view and single panes |
 | `1`–`9` | jump to pane N |
 | `0` or `a` | interleaved all-view |
 | `PgUp`/`PgDn`/`↑`/`↓` | scroll (bottom resumes follow) |
