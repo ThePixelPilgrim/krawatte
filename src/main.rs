@@ -14,6 +14,7 @@ use std::io::{self, Stdout};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use clap::Parser;
 use crossterm::event::{self, Event as CtEvent, KeyEventKind};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -49,16 +50,28 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn main() {
-    let commands: Vec<String> = std::env::args().skip(1).collect();
-    if commands.is_empty() {
-        eprintln!("usage: krawatte <command> [<command> ...]");
-        eprintln!("  each argument is a shell command run via `sh -c`");
-        std::process::exit(2);
-    }
+/// Full-screen terminal multi-tail: run several programs, follow their output
+/// interleaved or per pane, shut them all down with one Ctrl-C.
+#[derive(Debug, Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Grace period in seconds between SIGTERM and SIGKILL during shutdown.
+    #[arg(short, long, default_value_t = 5.0, value_name = "SECS")]
+    timeout: f64,
 
-    let config = Config::default();
-    match run(&commands, &config) {
+    /// Shell commands to run; each argument is passed to `sh -c`.
+    #[arg(required = true, value_name = "COMMAND", trailing_var_arg = true, allow_hyphen_values = true)]
+    commands: Vec<String>,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let config = Config {
+        grace_period: Duration::from_secs_f64(cli.timeout.max(0.0)),
+        ..Config::default()
+    };
+    match run(&cli.commands, &config) {
         Ok((names, statuses)) => {
             print_final_statuses(&names, &statuses);
         }
