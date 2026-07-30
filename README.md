@@ -12,6 +12,10 @@ krawatte "cargo watch -x check" "npm run dev" "python worker.py"
 
 Each argument is one command, run via `sh -c` in its own process group.
 
+| Option | Meaning |
+|---|---|
+| `-t`, `--timeout <SECS>` | grace period between SIGTERM and SIGKILL on shutdown (default `5`) |
+
 ## Keys
 
 | Key | Action |
@@ -31,9 +35,17 @@ Each argument is one command, run via `sh -c` in its own process group.
 - **Scrollback**: ~10,000 lines per process, ANSI colors preserved.
 - **A child exiting** marks its slot dead (exit code shown); the others keep
   running and its buffer stays viewable.
-- **Ctrl-C / `q`** sends SIGTERM to every child's process group, waits up to
-  5 seconds, SIGKILLs stragglers, reaps everything, restores the terminal, and
-  prints each child's final status.
+- **Ctrl-C / `q`** sends SIGTERM to every child's process group, waits out the
+  grace period (`--timeout`, default 5s), SIGKILLs stragglers, reaps
+  everything, restores the terminal, and prints each child's final status.
+  Groups are signalled even when the child that led them has already exited,
+  so background jobs it left behind are shut down too rather than orphaned.
+  Shutdown is bounded: it never waits on a child it cannot force to exit, so
+  quitting always returns.
+
+A child that puts itself in a new session (`setsid`, or a tool that
+daemonizes) leaves krawatte's process group by design and so outlives it —
+that is the daemon's intent, and no pgid can reach it.
 
 Children write to pipes, not a TTY, so many tools disable color by default —
 force it per tool if you want it (e.g. `cargo ... --color=always`,
