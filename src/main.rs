@@ -72,8 +72,8 @@ fn main() {
         ..Config::default()
     };
     match run(&cli.commands, &config) {
-        Ok((names, statuses)) => {
-            print_final_statuses(&names, &statuses);
+        Ok((names, started, statuses)) => {
+            print_final_statuses(&names, &started, &statuses);
         }
         Err(e) => {
             eprintln!("krawatte: fatal error: {e}");
@@ -85,7 +85,7 @@ fn main() {
 /// Set up the terminal, spawn children, run the event loop, then shut down.
 /// Returns the per-process final statuses (indexed by [`ProcId`]) once the
 /// terminal has been restored.
-type RunResult = (Vec<String>, Vec<Option<ExitStatus>>);
+type RunResult = (Vec<String>, Vec<bool>, Vec<Option<ExitStatus>>);
 
 fn run(commands: &[String], config: &Config) -> io::Result<RunResult> {
     let (tx, rx) = mpsc::channel::<Event>();
@@ -97,6 +97,7 @@ fn run(commands: &[String], config: &Config) -> io::Result<RunResult> {
     let names: Vec<String> = (0..manager.len())
         .map(|p| manager.short_name(p).to_string())
         .collect();
+    let started: Vec<bool> = (0..manager.len()).map(|p| manager.was_started(p)).collect();
     let mut ui = UiState::new(names.clone());
 
     // Enter raw mode + alternate screen; the guard restores them on any exit
@@ -114,7 +115,7 @@ fn run(commands: &[String], config: &Config) -> io::Result<RunResult> {
         manager.shutdown()
     };
 
-    Ok((names, statuses))
+    Ok((names, started, statuses))
 }
 
 /// The main event loop: redraw, then wait briefly for a crossterm input event
@@ -184,16 +185,43 @@ fn health_from_exit(status: ExitStatus) -> Health {
 
 /// After the terminal is restored, print each child's final status to the
 /// normal screen.
-fn print_final_statuses(names: &[String], statuses: &[Option<ExitStatus>]) {
+fn print_final_statuses(names: &[String], started: &[bool], statuses: &[Option<ExitStatus>]) {
     println!("krawatte: all children stopped.");
     for (proc, name) in names.iter().enumerate() {
         let status = statuses.get(proc).copied().flatten();
-        let desc = match status {
-            Some(ExitStatus::Code(0)) => "exit 0".to_string(),
-            Some(ExitStatus::Code(c)) => format!("exit {c}"),
-            Some(ExitStatus::Signal(s)) => format!("killed by signal {s}"),
-            None => "did not start".to_string(),
-        };
+        let desc = status_label(started.get(proc).copied().unwrap_or(false), status);
         println!("  [{}] {:<20} {}", proc + 1, name, desc);
+    }
+}
+
+/// Describe one slot's outcome. A missing status means the child never spawned
+/// (`started == false`) or survived even SIGKILL and was abandoned so that
+/// shutdown could finish (`started == true`).
+fn status_label(started: bool, status: Option<ExitStatus>) -> String {
+    match status {
+        Some(ExitStatus::Code(c)) => format!("exit {c}"),
+        Some(ExitStatus::Signal(s)) => format!("killed by signal {s}"),
+        None if started => "did not exit (abandoned)".to_string(),
+        None => "did not start".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_label_distinguishes_never_started_from_never_exited() {
+        // A slot with no status can mean two very different things, and calling
+        // an abandoned process "did not start" misreports a process that may
+        // have been running the whole session.
+        assert_eq!(status_label(false, None), "did not start");
+        assert_eq!(status_label(true, None), "did not exit (abandoned)");
+        assert_eq!(status_label(true, Some(ExitStatus::Code(0))), "exit 0");
+        assert_eq!(status_label(true, Some(ExitStatus::Code(3))), "exit 3");
+        assert_eq!(
+            status_label(true, Some(ExitStatus::Signal(9))),
+            "killed by signal 9"
+        );
     }
 }
