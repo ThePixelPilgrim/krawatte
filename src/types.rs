@@ -6,7 +6,7 @@
 //! dependencies on `buffer`, `proc`, or `ui`, so it can be built and reasoned
 //! about in isolation.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Stable index identifying a single child process, `0..N` in CLI argument order.
 pub type ProcId = usize;
@@ -50,12 +50,15 @@ pub enum Health {
 #[derive(Debug)]
 pub enum Event {
     /// A full line arrived from a child stream. `seq` is the global sequence
-    /// number; `bytes` is the raw line without its trailing newline (ANSI
-    /// escapes still embedded, parsed downstream by the buffer).
+    /// number; `at` is the wall-clock arrival time, stamped in the reader
+    /// thread and used only for display; `bytes` is the raw line without its
+    /// trailing newline (ANSI escapes still embedded, parsed downstream by the
+    /// buffer).
     Line {
         proc: ProcId,
         stream: StreamTag,
         seq: Seq,
+        at: SystemTime,
         bytes: Vec<u8>,
     },
     /// A child process exited and was reaped.

@@ -8,6 +8,7 @@
 //! unit-test surface.
 
 use std::collections::VecDeque;
+use std::time::SystemTime;
 
 use ansi_to_tui::IntoText;
 use ratatui::text::Line as TuiLine;
@@ -20,6 +21,9 @@ pub struct StyledLine {
     pub proc: ProcId,
     pub stream: StreamTag,
     pub seq: Seq,
+    /// Wall-clock arrival time, stamped by the reader thread. Display-only:
+    /// ordering is governed by `seq` alone.
+    pub at: SystemTime,
     /// ANSI-parsed styled content, owned (`'static`).
     pub content: TuiLine<'static>,
 }
@@ -28,12 +32,19 @@ impl StyledLine {
     /// Parse a raw line (newline already stripped) into a styled line. ANSI
     /// escape sequences in `bytes` are converted to styled spans; invalid UTF-8
     /// is handled lossily.
-    pub fn parse(proc: ProcId, stream: StreamTag, seq: Seq, bytes: &[u8]) -> StyledLine {
+    pub fn parse(
+        proc: ProcId,
+        stream: StreamTag,
+        seq: Seq,
+        at: SystemTime,
+        bytes: &[u8],
+    ) -> StyledLine {
         let content = parse_line(bytes);
         StyledLine {
             proc,
             stream,
             seq,
+            at,
             content,
         }
     }
@@ -160,7 +171,11 @@ impl BufferSet {
     /// appear.
     pub fn interleaved(&self) -> Vec<&StyledLine> {
         // Cursor per buffer into its ordered lines.
-        let mut cursors: Vec<_> = self.buffers.iter().map(|b| b.lines.iter().peekable()).collect();
+        let mut cursors: Vec<_> = self
+            .buffers
+            .iter()
+            .map(|b| b.lines.iter().peekable())
+            .collect();
         let total: usize = self.buffers.iter().map(|b| b.len()).sum();
         let mut out: Vec<&StyledLine> = Vec::with_capacity(total);
 
@@ -196,8 +211,16 @@ mod tests {
         }
     }
 
+    /// Arrival time is irrelevant to buffering and ordering, so the helpers use
+    /// a fixed one.
     fn line(proc: ProcId, seq: Seq, text: &str) -> StyledLine {
-        StyledLine::parse(proc, StreamTag::Stdout, seq, text.as_bytes())
+        StyledLine::parse(
+            proc,
+            StreamTag::Stdout,
+            seq,
+            SystemTime::UNIX_EPOCH,
+            text.as_bytes(),
+        )
     }
 
     // --- ring buffer behavior -------------------------------------------
@@ -252,7 +275,7 @@ mod tests {
     fn ansi_color_parses_to_styled_spans() {
         // Red "err" then reset.
         let raw = b"\x1b[31merr\x1b[0m done";
-        let sl = StyledLine::parse(0, StreamTag::Stderr, 0, raw);
+        let sl = StyledLine::parse(0, StreamTag::Stderr, 0, SystemTime::UNIX_EPOCH, raw);
         // Reconstructed text drops escape codes.
         let text: String = sl
             .content
@@ -273,7 +296,7 @@ mod tests {
     #[test]
     fn invalid_utf8_is_lossy_not_panic() {
         let raw = &[0xff, 0xfe, b'h', b'i'];
-        let sl = StyledLine::parse(0, StreamTag::Stdout, 0, raw);
+        let sl = StyledLine::parse(0, StreamTag::Stdout, 0, SystemTime::UNIX_EPOCH, raw);
         let text: String = sl
             .content
             .spans

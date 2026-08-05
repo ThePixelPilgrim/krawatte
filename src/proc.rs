@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, setpgid};
@@ -215,7 +215,12 @@ impl Drop for ProcManager {
 
 /// Spawn a single child in its own process group, wiring reader threads for
 /// stdout/stderr and a waiter thread that reaps and reports the exit.
-type SpawnParts = (Pid, Arc<AtomicBool>, Arc<Mutex<Option<ExitStatus>>>, JoinHandle<()>);
+type SpawnParts = (
+    Pid,
+    Arc<AtomicBool>,
+    Arc<Mutex<Option<ExitStatus>>>,
+    JoinHandle<()>,
+);
 
 fn spawn_one(
     proc: ProcId,
@@ -310,16 +315,29 @@ fn spawn_reader(
 }
 
 /// Emit one line event, stripping a trailing `\r`, and reset the buffer.
-fn emit(proc: ProcId, stream: StreamTag, seq: &Arc<AtomicU64>, tx: &Sender<Event>, buf: &mut Vec<u8>) {
+///
+/// The arrival timestamp is taken here, next to the sequence number, so it
+/// records when the line actually reached krawatte -- unaffected by the UI
+/// thread's 50 ms batching. It is display-only; ordering stays governed by
+/// [`Seq`].
+fn emit(
+    proc: ProcId,
+    stream: StreamTag,
+    seq: &Arc<AtomicU64>,
+    tx: &Sender<Event>,
+    buf: &mut Vec<u8>,
+) {
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
     let s: Seq = seq.fetch_add(1, Ordering::SeqCst);
+    let at = SystemTime::now();
     let bytes = std::mem::take(buf);
     let _ = tx.send(Event::Line {
         proc,
         stream,
         seq: s,
+        at,
         bytes,
     });
 }
@@ -477,7 +495,9 @@ impl ShutdownMachine {
 
         // Grace expiry: escalate to SIGKILL exactly once.
         if self.phase == ShutdownPhase::Terminating {
-            let elapsed = effects.now().saturating_duration_since(self.started.unwrap());
+            let elapsed = effects
+                .now()
+                .saturating_duration_since(self.started.unwrap());
             if elapsed >= self.grace {
                 let survivors: Vec<ProcId> = self.live.iter().copied().collect();
                 for p in survivors {
@@ -539,9 +559,7 @@ impl ShutdownEffects for RealEffects<'_> {
             .procs
             .iter()
             .enumerate()
-            .filter(|(_, p)| {
-                p.dead.load(Ordering::SeqCst) && p.pgid.is_none_or(group_gone)
-            })
+            .filter(|(_, p)| p.dead.load(Ordering::SeqCst) && p.pgid.is_none_or(group_gone))
             .map(|(i, _)| i)
             .collect()
     }
@@ -696,7 +714,11 @@ mod tests {
         let mut m = ShutdownMachine::new([0], Duration::from_secs(5));
         m.run(&mut fx, Duration::from_millis(500));
         assert_eq!(m.phase(), ShutdownPhase::Done);
-        assert_eq!(fx.kill_calls, vec![0], "SIGKILL should still have been tried");
+        assert_eq!(
+            fx.kill_calls,
+            vec![0],
+            "SIGKILL should still have been tried"
+        );
         assert_eq!(m.abandoned(), vec![0]);
     }
 
@@ -715,11 +737,7 @@ mod tests {
         // slot must end up dead and status recorded.
         let (tx, rx) = mpsc::channel();
         let cfg = Config::default();
-        let mut mgr = ProcManager::spawn_all(
-            &["exit 7".to_string()],
-            &cfg,
-            tx,
-        );
+        let mut mgr = ProcManager::spawn_all(&["exit 7".to_string()], &cfg, tx);
         assert_eq!(mgr.len(), 1);
         wait_until_dead(&mgr);
         let statuses = mgr.shutdown();
@@ -847,11 +865,7 @@ mod tests {
             grace_period: Duration::from_millis(200),
             ..Config::default()
         };
-        let mgr = ProcManager::spawn_all(
-            &["setsid sleep 30 & echo started".to_string()],
-            &cfg,
-            tx,
-        );
+        let mgr = ProcManager::spawn_all(&["setsid sleep 30 & echo started".to_string()], &cfg, tx);
         wait_until_dead(&mgr);
         shutdown_within(mgr, Duration::from_secs(5));
     }
@@ -860,11 +874,7 @@ mod tests {
     fn line_events_carry_increasing_seq() {
         let (tx, rx) = mpsc::channel();
         let cfg = Config::default();
-        let mut mgr = ProcManager::spawn_all(
-            &["printf 'a\\nb\\nc\\n'".to_string()],
-            &cfg,
-            tx,
-        );
+        let mut mgr = ProcManager::spawn_all(&["printf 'a\\nb\\nc\\n'".to_string()], &cfg, tx);
         wait_until_dead(&mgr);
         let statuses = mgr.shutdown();
         assert_eq!(statuses[0], Some(ExitStatus::Code(0)));

@@ -10,5 +10,6 @@ repository = "https://github.com/ThePixelPilgrim/krawatte"
 ansi-to-tui = "8.0.1"
 clap = { version = "4.6.4", features = ["derive"] }
 crossterm = "0.29.0"
+jiff = "0.2.35"
 nix = { version = "0.31.3", features = ["signal", "process"] }
 ratatui = "0.30.2"

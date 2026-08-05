@@ -1,12 +1,21 @@
 //! Terminal UI: view state, key handling, and ratatui rendering.
 //!
 //! Holds which view is active (interleaved all-view or a single pane), scroll
-//! position, and follow-mode, and translates key events into state changes. The
-//! ratatui render layer is intentionally thin; all view/scroll/follow logic
-//! lives in plain, testable methods on [`UiState`]. Rendering reads from a
-//! [`BufferSet`](crate::buffer::BufferSet) and per-process [`Health`].
+//! position, follow-mode, and the timestamp display mode, and translates key
+//! events into state changes. The ratatui render layer is intentionally thin;
+//! all view/scroll/follow logic lives in plain, testable methods on
+//! [`UiState`]. Rendering reads from a [`BufferSet`](crate::buffer::BufferSet)
+//! and per-process [`Health`].
+//!
+//! This is the only module that knows about `jiff`: timestamps travel as plain
+//! [`SystemTime`] and are converted to wall-clock fields here, at the
+//! formatting boundary.
+
+use std::time::{Duration, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, Zoned};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -23,6 +32,31 @@ pub enum View {
     All,
     /// A single process's buffer in isolation.
     Single(ProcId),
+}
+
+/// How each line's arrival time is shown, cycled by `d`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeDisplay {
+    /// No timestamp prefix at all (the default; the UI looks as it always has).
+    Off,
+    /// Local-time ISO datetime, e.g. `2026-08-05T14:03:07`.
+    Iso,
+    /// Local time of day only, e.g. `14:03:07`.
+    TimeOnly,
+    /// Age relative to now in whole units, e.g. `12m ago`.
+    Ago,
+}
+
+impl TimeDisplay {
+    /// The next mode in the cycle: Off -> Iso -> TimeOnly -> Ago -> Off.
+    fn next(self) -> TimeDisplay {
+        match self {
+            TimeDisplay::Off => TimeDisplay::Iso,
+            TimeDisplay::Iso => TimeDisplay::TimeOnly,
+            TimeDisplay::TimeOnly => TimeDisplay::Ago,
+            TimeDisplay::Ago => TimeDisplay::Off,
+        }
+    }
 }
 
 /// Result of handling a key: whether the app should begin shutdown.
@@ -73,6 +107,8 @@ pub enum KeyCommand {
     PageUp,
     /// Scroll one page down.
     PageDown,
+    /// `d`: advance the timestamp display mode.
+    CycleTimeDisplay,
     /// No mapped action.
     None,
 }
@@ -87,6 +123,7 @@ pub fn map_key(key: KeyEvent) -> KeyCommand {
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => KeyCommand::PrevPane,
         KeyCode::Tab => KeyCommand::NextPane,
         KeyCode::Char('a') => KeyCommand::AllView,
+        KeyCode::Char('d') => KeyCommand::CycleTimeDisplay,
         KeyCode::Char('0') => KeyCommand::AllView,
         KeyCode::Char(c @ '1'..='9') => {
             // '1' -> pane 0
@@ -136,7 +173,11 @@ fn cycle_pane(view: View, count: usize, forward: bool) -> View {
         }
         View::Single(cur) => {
             if forward {
-                if cur + 1 >= count { View::All } else { View::Single(cur + 1) }
+                if cur + 1 >= count {
+                    View::All
+                } else {
+                    View::Single(cur + 1)
+                }
             } else if cur == 0 {
                 View::All
             } else {
@@ -161,11 +202,17 @@ pub struct UiState {
     viewport_height: usize,
     /// Number of content lines in the current view, cached from the last render.
     content_len: usize,
+    /// How line arrival times are shown; cycled by `d`.
+    time_display: TimeDisplay,
+    /// The local timezone, resolved once at startup. Held rather than looked up
+    /// per frame; it carries the full zone definition, so DST transitions during
+    /// a long session are still handled correctly.
+    tz: TimeZone,
 }
 
 impl UiState {
     /// Create initial state for the given per-process short names, starting in
-    /// the all-view, following the tail.
+    /// the all-view, following the tail, with timestamps off.
     pub fn new(names: Vec<String>) -> UiState {
         let proc_count = names.len();
         UiState {
@@ -176,7 +223,17 @@ impl UiState {
             scroll_offset: 0,
             viewport_height: 0,
             content_len: 0,
+            time_display: TimeDisplay::Off,
+            // Falls back to UTC if the system zone cannot be determined; never
+            // fails.
+            tz: TimeZone::system(),
         }
+    }
+
+    /// Current timestamp display mode.
+    #[allow(dead_code)]
+    pub fn time_display(&self) -> TimeDisplay {
+        self.time_display
     }
 
     /// Current view.
@@ -235,6 +292,9 @@ impl UiState {
             KeyCommand::LineDown => self.scroll_by(-1),
             KeyCommand::PageUp => self.scroll_by(self.viewport_height.max(1) as isize),
             KeyCommand::PageDown => self.scroll_by(-(self.viewport_height.max(1) as isize)),
+            // Purely presentational: deliberately leaves scroll and follow
+            // state alone, so cycling never yanks the user back to the tail.
+            KeyCommand::CycleTimeDisplay => self.time_display = self.time_display.next(),
             KeyCommand::None => {}
         }
         Action::Continue
@@ -247,13 +307,17 @@ impl UiState {
     }
 
     /// Collect the content lines for the current view as owned rendered lines,
-    /// each already carrying its per-process tag prefix (in the all-view).
-    fn content_lines(&self, buffers: &BufferSet) -> Vec<TuiLine<'static>> {
+    /// each already carrying its timestamp prefix (when enabled) and its
+    /// per-process tag prefix (in the all-view). `now` is the frame's reference
+    /// instant for relative times.
+    fn content_lines(&self, buffers: &BufferSet, now: SystemTime) -> Vec<TuiLine<'static>> {
+        let stamp =
+            |sl: &StyledLine, with_tag| tagged_line(sl, with_tag, self.time_display, now, &self.tz);
         match self.view {
             View::All => buffers
                 .interleaved()
                 .into_iter()
-                .map(|sl| tagged_line(sl, true))
+                .map(|sl| stamp(sl, true))
                 .collect(),
             View::Single(p) => {
                 if p >= self.proc_count {
@@ -262,7 +326,7 @@ impl UiState {
                 buffers
                     .buffer(p)
                     .iter()
-                    .map(|sl| tagged_line(sl, false))
+                    .map(|sl| stamp(sl, false))
                     .collect()
             }
         }
@@ -276,8 +340,13 @@ impl UiState {
             .constraints([Constraint::Length(1), Constraint::Min(0)])
             .split(area);
 
+        // One clock reading per frame, so every relative time on screen is
+        // measured against the same instant. Relative times refresh on the
+        // existing 50 ms redraw tick; no extra timer is needed.
+        let now = SystemTime::now();
+
         self.render_status_bar(frame, chunks[0]);
-        self.render_body(frame, chunks[1], buffers);
+        self.render_body(frame, chunks[1], buffers, now);
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
@@ -319,7 +388,7 @@ impl UiState {
         frame.render_widget(bar, area);
     }
 
-    fn render_body(&mut self, frame: &mut Frame, area: Rect, buffers: &BufferSet) {
+    fn render_body(&mut self, frame: &mut Frame, area: Rect, buffers: &BufferSet, now: SystemTime) {
         let title = match self.view {
             View::All => " all ".to_string(),
             View::Single(p) => format!(" pane {} ", p + 1),
@@ -327,7 +396,7 @@ impl UiState {
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
 
-        let lines = self.content_lines(buffers);
+        let lines = self.content_lines(buffers, now);
 
         // Cache viewport + content metrics so key handling clamps correctly.
         self.viewport_height = inner.height as usize;
@@ -359,10 +428,7 @@ impl UiState {
 fn health_glyph(health: Health) -> (String, Style) {
     match health {
         Health::Running => ("●".to_string(), Style::default().fg(Color::Green)),
-        Health::ExitedOk => (
-            "✔ exit 0".to_string(),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Health::ExitedOk => ("✔ exit 0".to_string(), Style::default().fg(Color::DarkGray)),
         Health::ExitedErr(status) => {
             let detail = match status {
                 ExitStatus::Code(c) => format!("✖ exit {c}"),
@@ -370,19 +436,102 @@ fn health_glyph(health: Health) -> (String, Style) {
             };
             (detail, Style::default().fg(Color::Red))
         }
-        Health::SpawnFailed => (
-            "✖ spawn".to_string(),
-            Style::default().fg(Color::Red),
-        ),
+        Health::SpawnFailed => ("✖ spawn".to_string(), Style::default().fg(Color::Red)),
     }
 }
 
-/// Build an owned rendered line from a stored [`StyledLine`], optionally
-/// prefixing a per-process colored tag (used in the all-view). stderr lines get
-/// a dim red marker.
-fn tagged_line(sl: &StyledLine, with_tag: bool) -> TuiLine<'static> {
+// ---------------------------------------------------------------------------
+// Timestamp formatting (pure, terminal- and host-timezone-independent)
+// ---------------------------------------------------------------------------
+
+/// Rendered when a timestamp lies outside the range jiff can represent, which
+/// takes an absurdly skewed clock. Same width as a real stamp so columns stay
+/// aligned, and formatting still never fails.
+const ISO_UNKNOWN: &str = "????-??-??T??:??:??";
+const TIME_UNKNOWN: &str = "??:??:??";
+
+/// Convert an arrival time into local wall-clock fields, or `None` if it is not
+/// representable.
+fn local(at: SystemTime, tz: &TimeZone) -> Option<Zoned> {
+    Timestamp::try_from(at)
+        .ok()
+        .map(|ts| ts.to_zoned(tz.clone()))
+}
+
+/// ISO datetime in `tz` to second precision, e.g. `2026-08-05T14:03:07`.
+fn format_iso(at: SystemTime, tz: &TimeZone) -> String {
+    match local(at, tz) {
+        Some(z) => format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            z.year(),
+            z.month(),
+            z.day(),
+            z.hour(),
+            z.minute(),
+            z.second()
+        ),
+        None => ISO_UNKNOWN.to_string(),
+    }
+}
+
+/// Time of day in `tz`, e.g. `14:03:07`.
+fn format_time_only(at: SystemTime, tz: &TimeZone) -> String {
+    match local(at, tz) {
+        Some(z) => format!("{:02}:{:02}:{:02}", z.hour(), z.minute(), z.second()),
+        None => TIME_UNKNOWN.to_string(),
+    }
+}
+
+/// Age of `at` as of `now`, in whole units of the largest fitting bucket:
+/// `Ns ago` under a minute, `Nm ago` under an hour, `Nh ago` under a day,
+/// `Nd ago` beyond. A line that appears newer than `now` (clock skew) reads as
+/// `0s ago` rather than a negative age.
+fn format_ago(at: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(at).unwrap_or(Duration::ZERO).as_secs();
+    match secs {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 60 * 60 => format!("{}m ago", s / 60),
+        s if s < 24 * 60 * 60 => format!("{}h ago", s / (60 * 60)),
+        s => format!("{}d ago", s / (24 * 60 * 60)),
+    }
+}
+
+/// The dim gray timestamp span prefixed to a line, or `None` when timestamps
+/// are off. Includes the separating space, so the rendered prefix reads e.g.
+/// `2026-08-05T14:03:07 `.
+fn time_prefix(
+    mode: TimeDisplay,
+    at: SystemTime,
+    now: SystemTime,
+    tz: &TimeZone,
+) -> Option<Span<'static>> {
+    let stamp = match mode {
+        TimeDisplay::Off => return None,
+        TimeDisplay::Iso => format_iso(at, tz),
+        TimeDisplay::TimeOnly => format_time_only(at, tz),
+        TimeDisplay::Ago => format_ago(at, now),
+    };
+    Some(Span::styled(
+        format!("{stamp} "),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+/// Build an owned rendered line from a stored [`StyledLine`]: an optional
+/// timestamp prefix, then optionally a per-process colored tag (used in the
+/// all-view). stderr lines get a dim red marker.
+fn tagged_line(
+    sl: &StyledLine,
+    with_tag: bool,
+    time_display: TimeDisplay,
+    now: SystemTime,
+    tz: &TimeZone,
+) -> TuiLine<'static> {
     use crate::types::StreamTag;
     let mut spans: Vec<Span<'static>> = Vec::new();
+    if let Some(span) = time_prefix(time_display, sl.at, now, tz) {
+        spans.push(span);
+    }
     if with_tag {
         spans.push(Span::styled(
             format!("{}│", sl.proc + 1),
@@ -395,9 +544,7 @@ fn tagged_line(sl: &StyledLine, with_tag: bool) -> TuiLine<'static> {
     if sl.stream == StreamTag::Stderr {
         spans.push(Span::styled(
             "!",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
         ));
         spans.push(Span::raw(" "));
     }
@@ -451,6 +598,14 @@ mod tests {
         assert_eq!(map_key(key(KeyCode::Char('9'))), KeyCommand::JumpPane(8));
         assert_eq!(map_key(key(KeyCode::Char('0'))), KeyCommand::AllView);
         assert_eq!(map_key(key(KeyCode::Char('a'))), KeyCommand::AllView);
+    }
+
+    #[test]
+    fn map_key_cycle_time_display() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('d'))),
+            KeyCommand::CycleTimeDisplay
+        );
     }
 
     #[test]
@@ -557,6 +712,128 @@ mod tests {
         let mut s = ui(1);
         s.set_health(99, Health::ExitedOk); // must not panic
         assert!(s.following());
+    }
+
+    // --- timestamp display ----------------------------------------------
+
+    /// A fixed +02:00 zone, so assertions on the absolute formats do not depend
+    /// on the host's timezone.
+    fn fixed_tz() -> TimeZone {
+        TimeZone::fixed(jiff::tz::Offset::constant(2))
+    }
+
+    /// A `SystemTime` `secs` after the Unix epoch.
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn time_display_next_wraps() {
+        assert_eq!(TimeDisplay::Off.next(), TimeDisplay::Iso);
+        assert_eq!(TimeDisplay::Iso.next(), TimeDisplay::TimeOnly);
+        assert_eq!(TimeDisplay::TimeOnly.next(), TimeDisplay::Ago);
+        assert_eq!(TimeDisplay::Ago.next(), TimeDisplay::Off);
+    }
+
+    #[test]
+    fn time_display_starts_off_and_cycles_on_d() {
+        let mut s = ui(2);
+        assert_eq!(s.time_display(), TimeDisplay::Off);
+        for expected in [
+            TimeDisplay::Iso,
+            TimeDisplay::TimeOnly,
+            TimeDisplay::Ago,
+            TimeDisplay::Off,
+        ] {
+            s.handle_key(key(KeyCode::Char('d')));
+            assert_eq!(s.time_display(), expected);
+        }
+    }
+
+    #[test]
+    fn cycling_time_display_keeps_scroll_and_view() {
+        // The mode is purely presentational: a user reading scrollback must not
+        // be snapped back to the tail for pressing `d`.
+        let mut s = ui(3);
+        s.handle_key(key(KeyCode::Char('2')));
+        s.content_len = 100;
+        s.viewport_height = 10;
+        s.scroll_by(5);
+        assert!(!s.following());
+        s.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(s.time_display(), TimeDisplay::Iso);
+        assert!(!s.following());
+        assert_eq!(s.view(), View::Single(1));
+    }
+
+    #[test]
+    fn iso_and_time_only_render_in_the_given_zone() {
+        // 2026-08-05T12:03:07Z is 14:03:07 at +02:00.
+        let t = at(1_785_931_387);
+        assert_eq!(format_iso(t, &fixed_tz()), "2026-08-05T14:03:07");
+        assert_eq!(format_time_only(t, &fixed_tz()), "14:03:07");
+    }
+
+    #[test]
+    fn iso_pads_every_field() {
+        // 2026-01-15T22:45:01Z is 2026-01-16T00:45:01 at +02:00: single-digit
+        // month/day/hour must still be two digits, and the date must roll over.
+        let t = at(1_768_517_101);
+        assert_eq!(format_iso(t, &fixed_tz()), "2026-01-16T00:45:01");
+        assert_eq!(format_time_only(t, &fixed_tz()), "00:45:01");
+    }
+
+    #[test]
+    fn ago_uses_whole_unit_buckets() {
+        let now = at(10_000_000);
+        assert_eq!(format_ago(now, now), "0s ago");
+        assert_eq!(format_ago(at(10_000_000 - 59), now), "59s ago");
+        assert_eq!(format_ago(at(10_000_000 - 60), now), "1m ago");
+        // Truncating, not rounding: 119 s is still one minute.
+        assert_eq!(format_ago(at(10_000_000 - 119), now), "1m ago");
+        assert_eq!(format_ago(at(10_000_000 - 3_599), now), "59m ago");
+        assert_eq!(format_ago(at(10_000_000 - 3_600), now), "1h ago");
+        assert_eq!(format_ago(at(10_000_000 - 86_399), now), "23h ago");
+        assert_eq!(format_ago(at(10_000_000 - 86_400), now), "1d ago");
+        assert_eq!(format_ago(at(10_000_000 - 9 * 86_400), now), "9d ago");
+    }
+
+    #[test]
+    fn ago_clamps_a_line_from_the_future() {
+        // Clock skew (or an NTP step) can leave a line stamped after `now`;
+        // that must read as `0s ago`, never as a negative age or a panic.
+        let now = at(10_000_000);
+        assert_eq!(format_ago(at(10_000_060), now), "0s ago");
+    }
+
+    #[test]
+    fn time_prefix_is_dim_and_separated() {
+        let now = at(1_785_931_387);
+        assert!(time_prefix(TimeDisplay::Off, now, now, &fixed_tz()).is_none());
+
+        let span = time_prefix(TimeDisplay::Iso, now, now, &fixed_tz()).unwrap();
+        assert_eq!(span.content.as_ref(), "2026-08-05T14:03:07 ");
+        assert_eq!(span.style.fg, Some(Color::DarkGray));
+
+        let span = time_prefix(TimeDisplay::TimeOnly, now, now, &fixed_tz()).unwrap();
+        assert_eq!(span.content.as_ref(), "14:03:07 ");
+
+        let span = time_prefix(TimeDisplay::Ago, now, now, &fixed_tz()).unwrap();
+        assert_eq!(span.content.as_ref(), "0s ago ");
+    }
+
+    #[test]
+    fn tagged_line_prepends_the_stamp_before_the_tag() {
+        let now = at(1_785_931_387);
+        let sl = StyledLine::parse(0, crate::types::StreamTag::Stdout, 0, now, b"hello");
+
+        let plain = tagged_line(&sl, true, TimeDisplay::Off, now, &fixed_tz());
+        let text: String = plain.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "1│ hello");
+
+        let stamped = tagged_line(&sl, true, TimeDisplay::TimeOnly, now, &fixed_tz());
+        let text: String = stamped.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "14:03:07 1│ hello");
     }
 
     #[test]

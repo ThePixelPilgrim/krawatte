@@ -23,6 +23,7 @@ Each argument is one command, run via `sh -c` in its own process group.
 | `Tab` / `Shift-Tab` | cycle forward / backward through the all-view and single panes |
 | `1`–`9` | jump to pane N |
 | `0` or `a` | interleaved all-view |
+| `d` | cycle line timestamps: off → ISO datetime → time only → relative |
 | `PgUp`/`PgDn`/`↑`/`↓` | scroll (returning to the bottom resumes follow) |
 | `q` or Ctrl-C | shut down all children and exit |
 
@@ -33,6 +34,8 @@ Each argument is one command, run via `sh -c` in its own process group.
 - **Interleaved view** merges all outputs in arrival order, each line prefixed
   with a colored per-process tag; single panes show one program in isolation.
 - **Scrollback**: ~10,000 lines per process, ANSI colors preserved.
+- **Timestamps** (`d`) prefix each line with its arrival time, in local time or
+  as an age (`12m ago`) that keeps counting up. Off by default.
 - **A child exiting** marks its slot dead (exit code shown); the others keep
   running and its buffer stays viewable.
 - **Ctrl-C / `q`** sends SIGTERM to every child's process group, waits out the

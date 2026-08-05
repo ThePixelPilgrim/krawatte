@@ -15,11 +15,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::Parser;
+use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event as CtEvent, KeyEventKind};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use crossterm::ExecutableCommand;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -60,7 +60,12 @@ struct Cli {
     timeout: f64,
 
     /// Shell commands to run; each argument is passed to `sh -c`.
-    #[arg(required = true, value_name = "COMMAND", trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(
+        required = true,
+        value_name = "COMMAND",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     commands: Vec<String>,
 }
 
@@ -159,10 +164,11 @@ fn drain_events(
                 proc,
                 stream,
                 seq,
+                at,
                 bytes,
             } => {
                 if proc < n {
-                    buffers.push(StyledLine::parse(proc, stream, seq, &bytes));
+                    buffers.push(StyledLine::parse(proc, stream, seq, at, &bytes));
                 }
             }
             Event::Exited { proc, status } => {
