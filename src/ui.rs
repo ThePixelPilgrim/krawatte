@@ -21,6 +21,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::buffer::{BufferSet, StyledLine};
 use crate::types::{ExitStatus, Health, ProcId};
@@ -109,6 +111,8 @@ pub enum KeyCommand {
     PageDown,
     /// `d`: advance the timestamp display mode.
     CycleTimeDisplay,
+    /// `w`: toggle wrapping of over-wide lines onto continuation rows.
+    ToggleWrap,
     /// No mapped action.
     None,
 }
@@ -124,6 +128,7 @@ pub fn map_key(key: KeyEvent) -> KeyCommand {
         KeyCode::Tab => KeyCommand::NextPane,
         KeyCode::Char('a') => KeyCommand::AllView,
         KeyCode::Char('d') => KeyCommand::CycleTimeDisplay,
+        KeyCode::Char('w') => KeyCommand::ToggleWrap,
         KeyCode::Char('0') => KeyCommand::AllView,
         KeyCode::Char(c @ '1'..='9') => {
             // '1' -> pane 0
@@ -204,6 +209,18 @@ pub struct UiState {
     content_len: usize,
     /// How line arrival times are shown; cycled by `d`.
     time_display: TimeDisplay,
+    /// Whether over-wide lines are wrapped onto continuation rows; toggled by
+    /// `w`. Off by default so the UI behaves as it always has unless asked.
+    wrap: bool,
+    /// First visual row of each logical line, cached from the last render. With
+    /// wrapping off this is the identity; with it on it is what turns a logical
+    /// line index into a scroll offset and back.
+    line_starts: Vec<usize>,
+    /// Logical line to restore to the bottom of the viewport on the next
+    /// render, recorded when `w` is pressed while scrolled up. The re-anchoring
+    /// cannot happen at key time because the new row layout is only known once
+    /// the next frame's width is in hand.
+    pending_anchor: Option<usize>,
     /// The local timezone, resolved once at startup. Held rather than looked up
     /// per frame; it carries the full zone definition, so DST transitions during
     /// a long session are still handled correctly.
@@ -224,6 +241,9 @@ impl UiState {
             viewport_height: 0,
             content_len: 0,
             time_display: TimeDisplay::Off,
+            wrap: false,
+            line_starts: Vec::new(),
+            pending_anchor: None,
             // Falls back to UTC if the system zone cannot be determined; never
             // fails.
             tz: TimeZone::system(),
@@ -234,6 +254,12 @@ impl UiState {
     #[allow(dead_code)]
     pub fn time_display(&self) -> TimeDisplay {
         self.time_display
+    }
+
+    /// True while long lines are wrapped onto continuation rows.
+    #[allow(dead_code)]
+    pub fn wrap(&self) -> bool {
+        self.wrap
     }
 
     /// Current view.
@@ -295,9 +321,42 @@ impl UiState {
             // Purely presentational: deliberately leaves scroll and follow
             // state alone, so cycling never yanks the user back to the tail.
             KeyCommand::CycleTimeDisplay => self.time_display = self.time_display.next(),
+            // Following the tail stays following: the tail is the anchor and it
+            // survives any re-layout for free. Scrolled up, the bottom visible
+            // logical line is the user's place in the text, so it is recorded
+            // and restored once the next render knows the new row layout.
+            KeyCommand::ToggleWrap => {
+                if !self.following() {
+                    self.pending_anchor = self.bottom_logical_line();
+                }
+                self.wrap = !self.wrap;
+            }
             KeyCommand::None => {}
         }
         Action::Continue
+    }
+
+    /// Index of the logical line owning the bottom visible row, or `None` when
+    /// nothing has been rendered yet and there is no row layout to consult.
+    fn bottom_logical_line(&self) -> Option<usize> {
+        let bottom_row = self.content_len.checked_sub(1 + self.scroll_offset)?;
+        // `line_starts` is ascending, so the owning line is the last one whose
+        // first row is at or above `bottom_row`.
+        self.line_starts
+            .partition_point(|&start| start <= bottom_row)
+            .checked_sub(1)
+    }
+
+    /// The bottom-anchored offset that puts the last row of logical line
+    /// `index` on the last visible row, clamped into range. Uses the row layout
+    /// cached by the current render.
+    fn offset_putting_line_at_bottom(&self, index: usize) -> usize {
+        let last_row = match self.line_starts.get(index + 1) {
+            Some(&next_start) => next_start.saturating_sub(1),
+            None => self.content_len.saturating_sub(1),
+        };
+        let offset = self.content_len.saturating_sub(1).saturating_sub(last_row);
+        offset.min(self.max_offset())
     }
 
     /// Scroll by `delta_up` lines (positive toward older lines), clamped.
@@ -310,7 +369,11 @@ impl UiState {
     /// each already carrying its timestamp prefix (when enabled) and its
     /// per-process tag prefix (in the all-view). `now` is the frame's reference
     /// instant for relative times.
-    fn content_lines(&self, buffers: &BufferSet, now: SystemTime) -> Vec<TuiLine<'static>> {
+    fn content_lines(
+        &self,
+        buffers: &BufferSet,
+        now: SystemTime,
+    ) -> Vec<(TuiLine<'static>, usize)> {
         let stamp =
             |sl: &StyledLine, with_tag| tagged_line(sl, with_tag, self.time_display, now, &self.tz);
         match self.view {
@@ -383,6 +446,15 @@ impl UiState {
             Span::styled(" SCROLL", Style::default().fg(Color::Yellow))
         };
         spans.push(follow_marker);
+        // Dim, so it reads as a mode annotation next to FOLLOW/SCROLL rather
+        // than competing with them, and so the mode is discoverable without
+        // pressing a key.
+        if self.wrap {
+            spans.push(Span::styled(
+                " WRAP",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
         let bar = Paragraph::new(TuiLine::from(spans))
             .style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_widget(bar, area);
@@ -396,11 +468,33 @@ impl UiState {
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
 
-        let lines = self.content_lines(buffers, now);
+        let logical = self.content_lines(buffers, now);
+
+        // Wrapping happens here, before the Paragraph ever sees the text, so
+        // "one line = one row" stays true and every existing piece of scroll
+        // arithmetic keeps working in units of rows unchanged.
+        let width = inner.width as usize;
+        let mut line_starts = Vec::with_capacity(logical.len());
+        let mut lines: Vec<TuiLine<'static>> = Vec::with_capacity(logical.len());
+        for (line, prefix_width) in logical {
+            line_starts.push(lines.len());
+            if self.wrap {
+                lines.extend(wrap_line(line, prefix_width, width));
+            } else {
+                lines.push(line);
+            }
+        }
 
         // Cache viewport + content metrics so key handling clamps correctly.
         self.viewport_height = inner.height as usize;
         self.content_len = lines.len();
+        self.line_starts = line_starts;
+
+        // Restore the anchored logical line to the bottom of the viewport now
+        // that the new row layout is known.
+        if let Some(anchor) = self.pending_anchor.take() {
+            self.scroll_offset = self.offset_putting_line_at_bottom(anchor);
+        }
 
         // Re-clamp the offset in case the content shrank since the last key.
         let max_off = self.max_offset();
@@ -408,17 +502,19 @@ impl UiState {
             self.scroll_offset = max_off;
         }
 
-        // Bottom-anchored: top line index = content_len - viewport - offset.
+        // Bottom-anchored: top row index = content_len - viewport - offset.
         let top = self
             .content_len
             .saturating_sub(self.viewport_height)
             .saturating_sub(self.scroll_offset);
 
-        // ratatui's scroll offset is a u16; clamp rather than cast so a very
-        // large interleaved buffer (e.g. many chatty processes summing past
-        // 65_535 lines) cannot wrap modulo 65_536 into a jumbled position.
-        let top = top.min(u16::MAX as usize) as u16;
-        let para = Paragraph::new(lines).block(block).scroll((top, 0));
+        // Drop the rows above the viewport instead of handing the index to
+        // `Paragraph::scroll`, whose offset is a `u16`: with wrapping on,
+        // `content_len` counts visual rows, an unbounded multiple of the line
+        // count, so a single chatty process can push `top` past 65_535 and a
+        // cast would wrap (and a clamp would silently freeze the view).
+        let visible = lines.split_off(top);
+        let para = Paragraph::new(visible).block(block);
         frame.render_widget(para, area);
     }
 }
@@ -520,21 +616,29 @@ fn time_prefix(
 /// Build an owned rendered line from a stored [`StyledLine`]: an optional
 /// timestamp prefix, then optionally a per-process colored tag (used in the
 /// all-view). stderr lines get a dim red marker.
+///
+/// Also returns the display width of that prefix in cells: wrapping needs it to
+/// indent continuation rows under the content column, and only this function
+/// knows which prefix parts were actually emitted.
 fn tagged_line(
     sl: &StyledLine,
     with_tag: bool,
     time_display: TimeDisplay,
     now: SystemTime,
     tz: &TimeZone,
-) -> TuiLine<'static> {
+) -> (TuiLine<'static>, usize) {
     use crate::types::StreamTag;
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut prefix_width = 0usize;
     if let Some(span) = time_prefix(time_display, sl.at, now, tz) {
+        prefix_width += span.content.width();
         spans.push(span);
     }
     if with_tag {
+        let tag = format!("{}│", sl.proc + 1);
+        prefix_width += tag.width() + 1;
         spans.push(Span::styled(
-            format!("{}│", sl.proc + 1),
+            tag,
             Style::default()
                 .fg(proc_color(sl.proc))
                 .add_modifier(Modifier::BOLD),
@@ -542,6 +646,7 @@ fn tagged_line(
         spans.push(Span::raw(" "));
     }
     if sl.stream == StreamTag::Stderr {
+        prefix_width += 2;
         spans.push(Span::styled(
             "!",
             Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
@@ -550,7 +655,89 @@ fn tagged_line(
     }
     // Clone the parsed content spans into the new owned line.
     spans.extend(sl.content.spans.iter().cloned());
-    TuiLine::from(spans)
+    (TuiLine::from(spans), prefix_width)
+}
+
+/// Terminal tab stop interval. Fixed at 8 because that is what every terminal
+/// emulator krawatte targets uses and there is no way to query the real value.
+const TAB_STOP: usize = 8;
+
+/// Display width of a grapheme cluster starting at column `col`.
+///
+/// `unicode-width` reports 0 for TAB, but a terminal advances to the next tab
+/// stop. Counting it as 0 would let a row be packed far past the viewport edge
+/// and clipped — losing exactly the content wrapping exists to preserve — so
+/// tabs are measured against their column instead.
+fn grapheme_width(g: &str, col: usize) -> usize {
+    if g == "\t" {
+        TAB_STOP - (col % TAB_STOP)
+    } else {
+        g.width()
+    }
+}
+
+/// Split one rendered line into the visual rows it occupies in a `width`-cell
+/// viewport, so that krawatte — not ratatui — owns the row count and the
+/// invariant "one line = one row" that all the scroll arithmetic rests on.
+///
+/// Breaks are hard, at the last grapheme cluster that fits, because log output
+/// is machine output: reflowing at spaces would hide where the real breaks are.
+/// Each span's `Style` survives a break, wide characters are never sliced
+/// mid-cell, and continuation rows are indented by `prefix_width` so wrapped
+/// text forms a block under the content column.
+fn wrap_line(line: TuiLine<'static>, prefix_width: usize, width: usize) -> Vec<TuiLine<'static>> {
+    // An indent wider than half the viewport would leave (almost) no room for
+    // content and could push a long line into an absurd number of rows, so in
+    // that degenerate case the indent is dropped entirely. Exactly half is
+    // still usable, and keeping the indent there keeps the prefix column
+    // unambiguous.
+    let indent = if width == 0 || prefix_width.saturating_mul(2) > width {
+        0
+    } else {
+        prefix_width
+    };
+    // Columns are absolute, so a row's content is bounded by the viewport edge
+    // whether or not it carries the indent. Floored above the indent so at
+    // least one cell of content fits and the loop always makes progress.
+    let limit = width.max(indent + 1);
+
+    let mut rows: Vec<TuiLine<'static>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut col = 0usize;
+    // Column the current row's content begins at: 0 on the first row, the
+    // indent afterwards. Comparing `col` against it is the progress guard —
+    // a grapheme too wide for a whole row is kept rather than bounced forever.
+    let mut row_start = 0usize;
+
+    for span in line.spans {
+        let style = span.style;
+        let mut buf = String::new();
+        for g in span.content.as_ref().graphemes(true) {
+            let w = grapheme_width(g, col);
+            // Break *before* the grapheme that would overflow, so a wide
+            // character is never sliced across the row boundary.
+            if col > row_start && col + w > limit {
+                if !buf.is_empty() {
+                    cur.push(Span::styled(std::mem::take(&mut buf), style));
+                }
+                rows.push(TuiLine::from(std::mem::take(&mut cur)));
+                if indent > 0 {
+                    cur.push(Span::raw(" ".repeat(indent)));
+                }
+                col = indent;
+                row_start = indent;
+            }
+            buf.push_str(g);
+            col += grapheme_width(g, col);
+        }
+        if !buf.is_empty() {
+            cur.push(Span::styled(buf, style));
+        }
+    }
+    // The trailing row is always emitted, so an empty line still occupies one
+    // row and the row count never drifts from the logical line count.
+    rows.push(TuiLine::from(cur));
+    rows
 }
 
 #[cfg(test)]
@@ -827,11 +1014,11 @@ mod tests {
         let now = at(1_785_931_387);
         let sl = StyledLine::parse(0, crate::types::StreamTag::Stdout, 0, now, b"hello");
 
-        let plain = tagged_line(&sl, true, TimeDisplay::Off, now, &fixed_tz());
+        let (plain, _) = tagged_line(&sl, true, TimeDisplay::Off, now, &fixed_tz());
         let text: String = plain.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "1│ hello");
 
-        let stamped = tagged_line(&sl, true, TimeDisplay::TimeOnly, now, &fixed_tz());
+        let (stamped, _) = tagged_line(&sl, true, TimeDisplay::TimeOnly, now, &fixed_tz());
         let text: String = stamped.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "14:03:07 1│ hello");
     }
@@ -849,6 +1036,295 @@ mod tests {
             "✖ sig 9"
         );
         assert_eq!(health_glyph(Health::SpawnFailed).0, "✖ spawn");
+    }
+
+    // --- line wrapping ----------------------------------------------------
+
+    /// The plain text of a rendered line, for asserting on wrap results without
+    /// caring about span boundaries.
+    fn plain(line: &TuiLine<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// A line built from `(text, style)` pairs, so a test can place a break in
+    /// the middle of a styled span.
+    fn styled_line(parts: &[(&str, Style)]) -> TuiLine<'static> {
+        TuiLine::from(
+            parts
+                .iter()
+                .map(|(t, st)| Span::styled((*t).to_string(), *st))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn wrap_line_short_line_is_one_row_unchanged() {
+        let line = styled_line(&[("hello", Style::default())]);
+        let rows = wrap_line(line, 0, 20);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(plain(&rows[0]), "hello");
+    }
+
+    #[test]
+    fn wrap_line_exact_width_does_not_spill_a_blank_row() {
+        // A line filling the viewport exactly must not produce an empty
+        // continuation row: that would waste a row and misreport the row count.
+        let line = styled_line(&[("abcde", Style::default())]);
+        let rows = wrap_line(line, 0, 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(plain(&rows[0]), "abcde");
+    }
+
+    #[test]
+    fn wrap_line_breaks_hard_at_the_last_fitting_cell() {
+        // Hard break, not word wrap: the space in the middle is irrelevant.
+        let line = styled_line(&[("abc def", Style::default())]);
+        let rows = wrap_line(line, 0, 4);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(plain(&rows[0]), "abc ");
+        assert_eq!(plain(&rows[1]), "def");
+    }
+
+    #[test]
+    fn wrap_line_continuation_rows_carry_the_prefix_indent() {
+        // The prefix ("1│ ") is 3 cells; continuation rows must start under the
+        // content column so the prefix column stays unambiguous.
+        let line = styled_line(&[("1│ ", Style::default()), ("abcdefgh", Style::default())]);
+        let rows = wrap_line(line, 3, 8);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(plain(&rows[0]), "1│ abcde");
+        assert_eq!(plain(&rows[1]), "   fgh");
+    }
+
+    #[test]
+    fn wrap_line_preserves_style_across_a_mid_span_break() {
+        let red = Style::default().fg(Color::Red);
+        let rows = wrap_line(styled_line(&[("abcdef", red)]), 0, 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(plain(&rows[0]), "abc");
+        assert_eq!(plain(&rows[1]), "def");
+        // Both halves of the split span keep the original style.
+        assert_eq!(rows[0].spans[0].style.fg, Some(Color::Red));
+        let tail = rows[1].spans.last().unwrap();
+        assert_eq!(tail.style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn wrap_line_never_splits_a_double_width_char() {
+        // Three 2-cell characters in a 3-cell viewport: the second character
+        // cannot straddle the boundary, so row 0 holds one character and one
+        // cell goes unused rather than slicing a glyph in half.
+        let rows = wrap_line(styled_line(&[("漢字漢", Style::default())]), 0, 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(plain(&rows[0]), "漢");
+        assert_eq!(plain(&rows[1]), "字");
+        assert_eq!(plain(&rows[2]), "漢");
+    }
+
+    #[test]
+    fn wrap_line_empty_line_yields_one_row() {
+        // A blank line still occupies a row; dropping it would shift the whole
+        // buffer relative to the scroll offset.
+        let rows = wrap_line(TuiLine::from(Vec::<Span<'static>>::new()), 0, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(plain(&rows[0]), "");
+    }
+
+    #[test]
+    fn wrap_line_zero_width_terminates() {
+        // A zero-width viewport must not loop forever: the available content
+        // width is floored at one cell.
+        let rows = wrap_line(styled_line(&[("abc", Style::default())]), 0, 0);
+        assert!(!rows.is_empty());
+        let joined: String = rows.iter().map(plain).collect();
+        assert_eq!(joined, "abc");
+    }
+
+    #[test]
+    fn wrap_line_prefix_wider_than_viewport_falls_back_to_no_indent() {
+        // An indent wider than half the viewport would leave (almost) no room
+        // for content, so the indent is dropped entirely and nothing is lost.
+        let rows = wrap_line(styled_line(&[("abcd", Style::default())]), 10, 2);
+        assert!(rows.len() >= 2);
+        let joined: String = rows.iter().map(plain).collect();
+        assert_eq!(joined, "abcd");
+        assert!(!rows[1].spans.is_empty());
+        assert!(!plain(&rows[1]).starts_with(' '));
+    }
+
+    #[test]
+    fn wrap_line_prefix_of_exactly_half_the_viewport_keeps_the_indent() {
+        // "Wider than half" is the fallback condition: at exactly half there
+        // are still as many content cells as prefix cells, so dropping the
+        // indent would needlessly blur the prefix column.
+        let line = styled_line(&[("aaaaa", Style::default()), ("bcdefghij", Style::default())]);
+        let rows = wrap_line(line, 5, 10);
+        assert_eq!(plain(&rows[0]), "aaaaabcdef");
+        assert_eq!(plain(&rows[1]), "     ghij");
+    }
+
+    #[test]
+    fn wrap_line_measures_tabs_against_the_next_tab_stop() {
+        // unicode-width calls TAB zero-wide, but the terminal advances to the
+        // next tab stop; counting it as 0 would overfill the row and the
+        // overflow would be clipped — the loss wrapping exists to prevent.
+        let rows = wrap_line(styled_line(&[("a\tb\tc", Style::default())]), 0, 16);
+        assert_eq!(rows.len(), 2);
+        // "a" (col 1) + tab (to 8) + "b" (col 9) + tab (to 16) fills the row.
+        assert_eq!(plain(&rows[0]), "a\tb\t");
+        assert_eq!(plain(&rows[1]), "c");
+    }
+
+    #[test]
+    fn wrap_line_breaking_on_a_span_boundary_loses_nothing() {
+        // The break falls exactly between two spans, the case where an
+        // off-by-one would silently drop or duplicate a span's first grapheme.
+        let red = Style::default().fg(Color::Red);
+        let rows = wrap_line(
+            styled_line(&[("abcd", Style::default()), ("efgh", red)]),
+            0,
+            4,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(plain(&rows[0]), "abcd");
+        assert_eq!(plain(&rows[1]), "efgh");
+        assert_eq!(rows[1].spans[0].style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn wrap_line_preserves_every_span_of_a_long_multi_span_line() {
+        // Nothing is dropped or re-ordered: stripping the indents must give
+        // back the input exactly, spans and all.
+        let red = Style::default().fg(Color::Red);
+        let parts: Vec<(String, Style)> = (0..20)
+            .map(|i| {
+                let style = if i % 2 == 0 { Style::default() } else { red };
+                (format!("span{i:02}-payload;"), style)
+            })
+            .collect();
+        let refs: Vec<(&str, Style)> = parts.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+        let expected: String = refs.iter().map(|(t, _)| *t).collect();
+
+        let rows = wrap_line(styled_line(&refs), 7, 30);
+        assert!(rows.len() > 1);
+        let joined: String = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let text = plain(r);
+                // Continuation rows carry the indent; everything after it is
+                // original content.
+                if i == 0 {
+                    text
+                } else {
+                    assert!(text.starts_with("       "));
+                    text[7..].to_string()
+                }
+            })
+            .collect();
+        assert_eq!(joined, expected);
+        // No content span invents a style: each carries one of the two inputs,
+        // and both survive the wrap.
+        let styles: Vec<Style> = rows
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .filter(|s| !s.content.trim().is_empty())
+            .map(|s| s.style)
+            .collect();
+        assert!(styles.iter().all(|s| *s == red || *s == Style::default()));
+        assert!(styles.contains(&red));
+        assert!(styles.contains(&Style::default()));
+    }
+
+    // --- wrap state -------------------------------------------------------
+
+    #[test]
+    fn map_key_toggle_wrap() {
+        assert_eq!(map_key(key(KeyCode::Char('w'))), KeyCommand::ToggleWrap);
+    }
+
+    #[test]
+    fn wrap_starts_off_and_toggles_on_w() {
+        let mut s = ui(2);
+        assert!(!s.wrap());
+        s.handle_key(key(KeyCode::Char('w')));
+        assert!(s.wrap());
+        s.handle_key(key(KeyCode::Char('w')));
+        assert!(!s.wrap());
+    }
+
+    #[test]
+    fn toggling_wrap_while_following_stays_following() {
+        // Pressing `w` at the tail must never knock the view off the tail.
+        let mut s = ui(2);
+        s.content_len = 100;
+        s.viewport_height = 10;
+        assert!(s.following());
+        s.handle_key(key(KeyCode::Char('w')));
+        assert!(s.wrap());
+        assert!(s.following());
+    }
+
+    /// A state carrying a hand-built row layout: four logical lines whose first
+    /// visual rows are `line_starts`, spanning `rows` visual rows in total.
+    /// Hand-built because the real layout is only produced by a render, which
+    /// needs a terminal.
+    fn with_layout(line_starts: Vec<usize>, rows: usize, viewport: usize) -> UiState {
+        let mut s = ui(3);
+        s.line_starts = line_starts;
+        s.content_len = rows;
+        s.viewport_height = viewport;
+        s
+    }
+
+    #[test]
+    fn bottom_logical_line_finds_the_line_owning_the_bottom_row() {
+        // Rows: line 0 -> 0..1, line 1 -> 2..4, line 2 -> 5, line 3 -> 6..8.
+        let mut s = with_layout(vec![0, 2, 5, 6], 9, 3);
+        assert_eq!(s.bottom_logical_line(), Some(3)); // at the tail
+        s.scroll_offset = 3; // bottom row 5
+        assert_eq!(s.bottom_logical_line(), Some(2));
+        s.scroll_offset = 4; // bottom row 4, mid-way through line 1
+        assert_eq!(s.bottom_logical_line(), Some(1));
+        // Nothing rendered yet: there is no layout to consult.
+        assert_eq!(ui(1).bottom_logical_line(), None);
+    }
+
+    #[test]
+    fn offset_putting_line_at_bottom_uses_the_lines_last_row() {
+        // A wrapped line must end up with its *last* row on the bottom visible
+        // row, not its first, or the tail of the anchored line is scrolled off.
+        let s = with_layout(vec![0, 2, 5, 6], 9, 3);
+        assert_eq!(s.offset_putting_line_at_bottom(3), 0);
+        assert_eq!(s.offset_putting_line_at_bottom(2), 3);
+        assert_eq!(s.offset_putting_line_at_bottom(1), 4);
+        // Line 0 ends on row 1; that offset exceeds max_offset (9 - 3) and is
+        // clamped to the oldest reachable position.
+        assert_eq!(s.offset_putting_line_at_bottom(0), 6);
+    }
+
+    #[test]
+    fn toggling_wrap_while_scrolled_keeps_the_bottom_line_at_the_bottom() {
+        // Scrolled up with wrapping on, the logical line at the bottom of the
+        // viewport is the user's anchor; turning wrapping off collapses the row
+        // layout, and the offset must be recomputed so that same line is at the
+        // bottom again — not left at its stale row-based value.
+        let mut s = with_layout(vec![0, 2, 5, 6], 9, 3);
+        s.wrap = true;
+        s.scroll_offset = 3; // bottom visible row 5 == logical line 2
+        assert!(!s.following());
+        s.handle_key(key(KeyCode::Char('w')));
+        assert!(!s.wrap());
+        assert_eq!(s.pending_anchor, Some(2));
+
+        // The next render installs the unwrapped layout (one row per line) and
+        // applies the anchor, as `render_body` does.
+        s.line_starts = vec![0, 1, 2, 3];
+        s.content_len = 4;
+        let anchor = s.pending_anchor.take().unwrap();
+        s.scroll_offset = s.offset_putting_line_at_bottom(anchor);
+        assert_eq!(s.scroll_offset, 1); // rows 0..2 visible, line 2 at bottom
+        assert!(!s.following());
     }
 
     // Keep KeyEventKind import used across crossterm versions where KeyEvent::new

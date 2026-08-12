@@ -24,6 +24,7 @@ Each argument is one command, run via `sh -c` in its own process group.
 | `1`–`9` | jump to pane N |
 | `0` or `a` | interleaved all-view |
 | `d` | cycle line timestamps: off → ISO datetime → time only → relative |
+| `w` | toggle wrapping of over-wide lines onto continuation rows |
 | `PgUp`/`PgDn`/`↑`/`↓` | scroll (returning to the bottom resumes follow) |
 | `q` or Ctrl-C | shut down all children and exit |
 
@@ -36,6 +37,11 @@ Each argument is one command, run via `sh -c` in its own process group.
 - **Scrollback**: ~10,000 lines per process, ANSI colors preserved.
 - **Timestamps** (`d`) prefix each line with its arrival time, in local time or
   as an age (`12m ago`) that keeps counting up. Off by default.
+- **Wrapping** (`w`) is off by default: long lines are clipped at the right
+  edge. Toggled on, they break hard at the last cell that fits and continue on
+  the next row, indented under the content column so the timestamp/tag prefix
+  stays its own column. The status bar shows `WRAP` while it is on, and
+  toggling keeps the line you were reading at the bottom of the viewport.
 - **A child exiting** marks its slot dead (exit code shown); the others keep
   running and its buffer stays viewable.
 - **Ctrl-C / `q`** sends SIGTERM to every child's process group, waits out the
