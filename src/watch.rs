@@ -6,15 +6,19 @@
 
 #![allow(dead_code)] // wired in by a later task
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use notify::event::ModifyKind;
+use notify::{ErrorKind, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::config::{ConfigError, Krawattefile, ProcSpec, Watch};
-use crate::types::{Changed, ProcId};
+use crate::types::{Changed, Event, ProcId};
 
 /// Patterns every slot ignores. Editor temp files, VCS and build trees: the
 /// things that change constantly and never mean "restart me". Directory
@@ -239,10 +243,188 @@ impl Debouncer {
     }
 }
 
+/// Whether a notify event kind means content changed. Access and metadata
+/// (chmod, mtime-only) events are noise.
+fn is_change(kind: &EventKind) -> bool {
+    !matches!(
+        kind,
+        EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_))
+    )
+}
+
+/// Owns the `notify` watcher and the set of directories registered with it.
+/// Descends directory trees itself, non-recursively per directory, so that
+/// ignored subtrees (`target`, `node_modules`, `.git`) are never registered.
+struct Registry {
+    watcher: RecommendedWatcher,
+    dirs: HashSet<PathBuf>,
+    /// Directory roots with their slot's ignore set, for deciding whether a
+    /// newly created directory should be descended into.
+    roots: Vec<(PathBuf, GlobSet)>,
+}
+
+impl Registry {
+    fn watch_dir(&mut self, dir: &Path) -> Result<(), notify::Error> {
+        if self.dirs.contains(dir) {
+            return Ok(());
+        }
+        self.watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        self.dirs.insert(dir.to_path_buf());
+        Ok(())
+    }
+
+    /// Register `start` and every non-ignored directory below it (relative
+    /// to `root` for ignore matching). Symlinked directories are not
+    /// followed, so a link cycle cannot recurse forever.
+    fn watch_tree(
+        &mut self,
+        root: &Path,
+        start: &Path,
+        ignore: &GlobSet,
+    ) -> Result<(), notify::Error> {
+        let mut stack = vec![start.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            self.watch_dir(&dir)?;
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+                if !is_dir {
+                    continue;
+                }
+                let path = entry.path();
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                if !ignored(ignore, rel) {
+                    stack.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A directory appeared under one of the roots: start watching it too.
+    fn on_new_dir(&mut self, path: &Path) {
+        let matching: Vec<(PathBuf, GlobSet)> = self
+            .roots
+            .iter()
+            .filter(|(root, ignore)| {
+                path.strip_prefix(root)
+                    .is_ok_and(|rel| !ignored(ignore, rel))
+            })
+            .cloned()
+            .collect();
+        for (root, ignore) in matching {
+            // Best effort: a failure here only means a subtree is unwatched;
+            // the next change at a higher level still restarts the slot.
+            let _ = self.watch_tree(&root, path, &ignore);
+        }
+    }
+}
+
+/// Register every slot's targets, then run the watcher on a detached thread
+/// that emits [`Event::Changed`] on `tx` after debouncing. Registration
+/// failures are returned so the caller can refuse to start half-watched;
+/// the inotify limit gets a message naming the sysctl to raise.
+pub fn start(
+    slots: Vec<SlotWatch>,
+    project_dir: PathBuf,
+    quiet: Duration,
+    tx: Sender<Event>,
+) -> Result<(), ConfigError> {
+    let (raw_tx, raw_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let watcher = notify::recommended_watcher(move |res| {
+        let _ = raw_tx.send(res);
+    })
+    .map_err(|e| watch_error(&project_dir, &project_dir, &e))?;
+    let mut registry = Registry {
+        watcher,
+        dirs: HashSet::new(),
+        roots: Vec::new(),
+    };
+
+    for slot in &slots {
+        for target in &slot.targets {
+            let result = match target {
+                WatchTarget::Dir(root) => {
+                    registry.roots.push((root.clone(), slot.ignore.clone()));
+                    registry.watch_tree(root, root, &slot.ignore)
+                }
+                WatchTarget::File { dir, .. } => registry.watch_dir(dir),
+            };
+            if let Err(e) = result {
+                let shown = match target {
+                    WatchTarget::Dir(p) => p.clone(),
+                    WatchTarget::File { dir, .. } => dir.clone(),
+                };
+                return Err(watch_error(&project_dir, &shown, &e));
+            }
+        }
+    }
+
+    std::thread::spawn(move || {
+        let mut debouncer = Debouncer::new(quiet);
+        loop {
+            let timeout = debouncer
+                .next_deadline()
+                .map(|d| d.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_secs(1));
+            match raw_rx.recv_timeout(timeout) {
+                Ok(Ok(ev)) => {
+                    if !is_change(&ev.kind) {
+                        continue;
+                    }
+                    let now = Instant::now();
+                    for path in &ev.paths {
+                        if matches!(ev.kind, EventKind::Create(_)) && path.is_dir() {
+                            registry.on_new_dir(path);
+                        }
+                        let rel = path
+                            .strip_prefix(&project_dir)
+                            .unwrap_or(path)
+                            .to_path_buf();
+                        for slot in &slots {
+                            if slot.matches(path) {
+                                debouncer.observe(slot.proc, rel.clone(), now);
+                            }
+                        }
+                    }
+                }
+                // A backend error for one path is not fatal; the next event
+                // for that slot still arrives.
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            for changed in debouncer.due(Instant::now()) {
+                if tx.send(Event::Changed(changed)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// A registration failure as a config error: names the path and, for the
+/// inotify limit, what to do about it.
+fn watch_error(project_dir: &Path, path: &Path, e: &notify::Error) -> ConfigError {
+    let shown = path.strip_prefix(project_dir).unwrap_or(path).display();
+    let message = match e.kind {
+        ErrorKind::MaxFilesWatch => format!(
+            "cannot watch {shown:?}: inotify watch limit reached; raise fs.inotify.max_user_watches (sysctl) or narrow the watch paths"
+        ),
+        _ => format!("cannot watch {shown:?}: {e}"),
+    };
+    ConfigError {
+        path: project_dir.join(crate::config::FILE_NAME),
+        line: None,
+        message,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     fn spec(name: &str, command: &str, cwd: &Path, watch: Watch, ignore: &[&str]) -> ProcSpec {
         ProcSpec {
@@ -519,5 +701,122 @@ mod tests {
         d.observe(0, "z".into(), start + ms(50));
         let rest = d.due(start + ms(150));
         assert_eq!(rest.iter().map(|c| c.proc).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    fn slot_for(root: &Path, proc: ProcId, watch: Watch) -> SlotWatch {
+        let kf = file_with(root, vec![spec("s", "x", root, watch, &[])]);
+        let mut s = resolve_all(&kf).unwrap().remove(0);
+        s.proc = proc;
+        s
+    }
+
+    fn next_changed(rx: &mpsc::Receiver<Event>, within: Duration) -> Option<Changed> {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Event::Changed(c)) => return Some(c),
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_write_under_a_watched_directory_yields_one_changed_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("src/nested")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        start(
+            vec![slot_for(&root, 3, paths(&["src"]))],
+            root.clone(),
+            ms(50),
+            tx,
+        )
+        .unwrap();
+
+        fs::write(root.join("src/nested/a.rs"), "x").unwrap();
+        fs::write(root.join("src/nested/a.rs"), "xy").unwrap();
+        let c = next_changed(&rx, Duration::from_secs(3)).expect("a change");
+        assert_eq!(c.proc, 3);
+        assert_eq!(c.paths, vec![PathBuf::from("src/nested/a.rs")]);
+        assert!(
+            next_changed(&rx, ms(300)).is_none(),
+            "the burst was coalesced"
+        );
+    }
+
+    #[test]
+    fn a_rename_onto_a_watched_file_is_seen_and_unrelated_files_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        start(
+            vec![slot_for(&root, 0, paths(&["target/debug/app"]))],
+            root.clone(),
+            ms(50),
+            tx,
+        )
+        .unwrap();
+
+        fs::write(root.join("target/debug/app.d"), "dep info").unwrap();
+        assert!(
+            next_changed(&rx, ms(400)).is_none(),
+            "sibling file is not the target"
+        );
+
+        fs::write(root.join("target/debug/app.tmp"), "binary").unwrap();
+        fs::rename(
+            root.join("target/debug/app.tmp"),
+            root.join("target/debug/app"),
+        )
+        .unwrap();
+        let c = next_changed(&rx, Duration::from_secs(3)).expect("the rename");
+        assert_eq!(c.paths, vec![PathBuf::from("target/debug/app")]);
+    }
+
+    #[test]
+    fn ignored_paths_produce_nothing_and_new_directories_are_picked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        start(
+            vec![slot_for(&root, 0, paths(&["."]))],
+            root.clone(),
+            ms(50),
+            tx,
+        )
+        .unwrap();
+
+        fs::write(root.join("node_modules/pkg/index.js"), "x").unwrap();
+        fs::write(root.join("src/main.rs.swp"), "x").unwrap();
+        assert!(next_changed(&rx, ms(400)).is_none());
+
+        fs::create_dir(root.join("src/new")).unwrap();
+        // Give the registry a moment to add the new directory before writing into it.
+        std::thread::sleep(ms(200));
+        let _ = next_changed(&rx, ms(200)); // the directory creation itself is a change; drain it
+        fs::write(root.join("src/new/b.rs"), "x").unwrap();
+        let c = next_changed(&rx, Duration::from_secs(3)).expect("write in a new subdirectory");
+        assert!(c.paths.contains(&PathBuf::from("src/new/b.rs")), "{c:?}");
+    }
+
+    #[test]
+    fn start_fails_fast_on_an_unwatchable_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let slot = SlotWatch {
+            proc: 0,
+            targets: vec![WatchTarget::Dir(root.join("vanished"))],
+            ignore: ignore_set(&[]).unwrap(),
+        };
+        let (tx, _rx) = mpsc::channel();
+        let err = start(vec![slot], root, ms(50), tx).unwrap_err();
+        assert!(err.to_string().contains("cannot watch"), "{err}");
     }
 }
