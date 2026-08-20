@@ -29,7 +29,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::buffer::{BufferSet, StyledLine};
 use crate::config::ProcSpec;
-use crate::proc::{ProcManager, Transition};
+use crate::proc::{Outcome, ProcManager, Transition};
 use crate::types::{Config, Event, ExitStatus, Health, Trigger};
 use crate::ui::{Action, UiState};
 use crate::watch::SlotWatch;
@@ -360,9 +360,18 @@ fn apply_transition(
             text,
         ));
     }
-    let health = match t.new.spawn {
-        Ok(_) => Health::Running,
-        Err(_) => Health::SpawnFailed,
+    let health = match (&t.new, &t.old) {
+        (Some(n), _) => match n.spawn {
+            Ok(_) => Health::Running,
+            Err(_) => Health::SpawnFailed,
+        },
+        // Stopped: show how the retired generation ended. An abandoned one
+        // was sent SIGKILL, the closest thing the bar can say.
+        (None, Some(o)) => match o.outcome {
+            Outcome::Exited(status) => health_from_exit(status),
+            Outcome::Abandoned => Health::ExitedErr(ExitStatus::Signal(9)),
+        },
+        (None, None) => Health::SpawnFailed,
     };
     ui.set_health(t.proc, health);
 }
@@ -548,7 +557,7 @@ mod tests {
                 more: 0
             }
         );
-        assert_eq!(t.new.command, "sleep 30");
+        assert_eq!(t.new.unwrap().command, "sleep 30");
         assert!(
             !manager.is_restarting(0),
             "the dropped change did not queue another"

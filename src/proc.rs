@@ -61,12 +61,43 @@ struct Generation {
     finished: bool,
 }
 
+/// What kind of command a slot's current generation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenKind {
+    /// The configured command.
+    Standard,
+    /// A one-shot command put there by `krawatte run`; when it exits on its
+    /// own the standard command resumes.
+    Override,
+}
+
+/// A point-in-time description of a slot, for `krawatte status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // read by the control handler, a later task
+pub struct SlotInfo {
+    /// 1-based, as shown in the status bar.
+    pub index: usize,
+    pub name: String,
+    pub r#gen: Gen,
+    /// Pid of the current generation's leader while it is alive.
+    pub pid: Option<i32>,
+    pub alive: bool,
+    /// What the current generation runs (or ran).
+    pub command: String,
+    pub standard: String,
+    pub kind: GenKind,
+    /// Time since the current generation was spawned, if it ever was.
+    pub since: Option<Duration>,
+}
+
 /// Per-slot state: the configured slot and its current generation.
 struct Proc {
     /// The slot as configured: name, standard command, cwd, env.
     spec: ProcSpec,
     /// Number of the most recent generation; `0` for the initial spawn.
     r#gen: Gen,
+    /// What kind of command the current generation runs.
+    kind: GenKind,
     /// The most recent generation, or `None` if the slot has never spawned
     /// successfully.
     live: Option<Generation>,
@@ -80,8 +111,11 @@ struct Restart {
     /// Single-slot TERM -> grace -> KILL machine; starts `Done` if there was
     /// nothing to tear down.
     machine: ShutdownMachine,
-    /// Command to spawn once the old generation is gone.
-    next: String,
+    /// Command to spawn once the old generation is gone; `None` leaves the
+    /// slot dead (`stop`).
+    next: Option<String>,
+    /// Kind of the generation `next` becomes.
+    kind: GenKind,
     /// What asked for the restart; reported in the [`Transition`].
     trigger: Trigger,
 }
@@ -122,7 +156,8 @@ pub struct Transition {
     pub proc: ProcId,
     /// `None` when the slot had no generation to end (it never started).
     pub old: Option<OldGen>,
-    pub new: NewGen,
+    /// `None` when the slot was stopped rather than respawned.
+    pub new: Option<NewGen>,
     /// What asked for the transition.
     pub trigger: Trigger,
 }
@@ -191,6 +226,7 @@ impl ProcManager {
             mgr.procs.push(Proc {
                 spec: spec.clone(),
                 r#gen: 0,
+                kind: GenKind::Standard,
                 live,
                 restart: None,
             });
@@ -267,11 +303,50 @@ impl ProcManager {
         &self.procs[proc].spec.name
     }
 
-    /// Tear down the slot's current generation (if any is still around), then
-    /// spawn `command` in its place. Non-blocking: the teardown is driven by
-    /// [`tick`](Self::tick). Returns `false`, doing nothing, if a restart is
+    /// Tear down the slot's current generation (if any), then spawn `command`
+    /// as a generation of the given kind. Non-blocking: the teardown is driven
+    /// by [`tick`](Self::tick). Returns `false`, doing nothing, if a restart is
     /// already in flight.
+    pub fn replace_with(
+        &mut self,
+        proc: ProcId,
+        command: String,
+        kind: GenKind,
+        trigger: Trigger,
+    ) -> bool {
+        self.begin(proc, Some(command), kind, trigger)
+    }
+
+    /// Replace keeping the current generation's kind: `r` on an override
+    /// restarts the override.
     pub fn replace(&mut self, proc: ProcId, command: String, trigger: Trigger) -> bool {
+        let kind = self.procs[proc].kind;
+        self.replace_with(proc, command, kind, trigger)
+    }
+
+    /// Tear down the current generation and spawn the slot's standard
+    /// command. Ends an override early.
+    pub fn kill(&mut self, proc: ProcId, trigger: Trigger) -> bool {
+        let standard = self.procs[proc].spec.command.clone();
+        self.replace_with(proc, standard, GenKind::Standard, trigger)
+    }
+
+    /// Tear down the current generation and leave the slot dead. The retired
+    /// generation stays on the slot so its exit status is still reported.
+    #[allow(dead_code)] // called by the control handler, a later task
+    pub fn stop(&mut self, proc: ProcId, trigger: Trigger) -> bool {
+        self.begin(proc, None, GenKind::Standard, trigger)
+    }
+
+    /// Start a teardown of the slot's current generation (if any is still
+    /// around), to be followed by spawning `next` if given.
+    fn begin(
+        &mut self,
+        proc: ProcId,
+        next: Option<String>,
+        kind: GenKind,
+        trigger: Trigger,
+    ) -> bool {
         let slot = &mut self.procs[proc];
         if slot.restart.is_some() {
             return false;
@@ -292,20 +367,11 @@ impl ProcManager {
         };
         slot.restart = Some(Restart {
             machine: ShutdownMachine::new(to_kill, self.grace_period),
-            next: command,
+            next,
+            kind,
             trigger,
         });
         true
-    }
-
-    /// Tear down the slot's current generation and spawn the slot's standard
-    /// command in its place. Today every generation *is* the standard command,
-    /// so this equals [`replace`](Self::replace) with the current command; it
-    /// diverges once an override can run in a slot. Returns `false`, doing
-    /// nothing, if a restart is already in flight.
-    pub fn kill(&mut self, proc: ProcId, trigger: Trigger) -> bool {
-        let standard = self.procs[proc].spec.command.clone();
-        self.replace(proc, standard, trigger)
     }
 
     /// Step every in-flight restart by one poll; spawn the next generation of
@@ -327,68 +393,52 @@ impl ProcManager {
         out
     }
 
-    /// Retire the slot's old generation and spawn the next one.
+    /// Retire the slot's old generation and spawn the next one, if any.
     fn complete(&mut self, proc: ProcId, restart: Restart) -> Transition {
         let Restart {
             machine,
             next,
+            kind,
             trigger,
         } = restart;
         let abandoned = !machine.abandoned().is_empty();
-        let old = self.procs[proc].live.take().map(|mut g| {
-            let ran = g.started.elapsed();
-            // Join only a waiter that has already published `dead`; an
-            // abandoned generation's waiter is still blocked in `wait()`.
-            if g.dead.load(Ordering::SeqCst)
-                && let Some(h) = g.waiter.take()
-            {
-                let _ = h.join();
-            }
-            let outcome = if abandoned {
-                Outcome::Abandoned
-            } else {
-                let status = *g.status.lock().unwrap();
-                Outcome::Exited(status.unwrap_or(ExitStatus::Code(-1)))
+        let old = self.procs[proc].live.as_mut().map(|g| retire(g, abandoned));
+        let new = next.map(|command| {
+            // A new generation replaces the retired one entirely.
+            self.procs[proc].live = None;
+            let r#gen = self.procs[proc].r#gen + 1;
+            self.procs[proc].r#gen = r#gen;
+            let spec = &self.procs[proc].spec;
+            let spawn = match spawn_one(
+                proc,
+                r#gen,
+                &self.shell,
+                &command,
+                spec,
+                &self.seq,
+                &self.tx,
+            ) {
+                Ok(g) => {
+                    let pid = g.pid;
+                    self.procs[proc].live = Some(g);
+                    Ok(pid)
+                }
+                Err(e) => {
+                    let _ = self.tx.send(Event::SpawnFailed {
+                        proc,
+                        r#gen,
+                        error: e.to_string(),
+                    });
+                    Err(e.to_string())
+                }
             };
-            OldGen {
-                r#gen: g.r#gen,
-                pid: g.pid,
-                outcome,
-                ran,
+            self.procs[proc].kind = kind;
+            NewGen {
+                r#gen,
+                command,
+                spawn,
             }
         });
-        let command = next;
-        let r#gen = self.procs[proc].r#gen + 1;
-        self.procs[proc].r#gen = r#gen;
-        let spec = &self.procs[proc].spec;
-        let spawn = match spawn_one(
-            proc,
-            r#gen,
-            &self.shell,
-            &command,
-            spec,
-            &self.seq,
-            &self.tx,
-        ) {
-            Ok(g) => {
-                let pid = g.pid;
-                self.procs[proc].live = Some(g);
-                Ok(pid)
-            }
-            Err(e) => {
-                let _ = self.tx.send(Event::SpawnFailed {
-                    proc,
-                    r#gen,
-                    error: e.to_string(),
-                });
-                Err(e.to_string())
-            }
-        };
-        let new = NewGen {
-            r#gen,
-            command,
-            spawn,
-        };
         Transition {
             proc,
             old,
@@ -413,6 +463,47 @@ impl ProcManager {
     /// Whether a teardown is in flight for this slot.
     pub fn is_restarting(&self, proc: ProcId) -> bool {
         self.procs.get(proc).is_some_and(|p| p.restart.is_some())
+    }
+
+    /// What kind of command the slot's current generation runs.
+    #[allow(dead_code)] // read by the control handler, a later task
+    pub fn kind(&self, proc: ProcId) -> GenKind {
+        self.procs[proc].kind
+    }
+
+    /// Whether the slot currently runs an override rather than its standard
+    /// command.
+    #[allow(dead_code)] // read by the control handler, a later task
+    pub fn is_override(&self, proc: ProcId) -> bool {
+        self.procs
+            .get(proc)
+            .is_some_and(|p| p.kind == GenKind::Override)
+    }
+
+    /// No live generation, or one that has exited.
+    pub fn is_dead(&self, proc: ProcId) -> bool {
+        self.procs[proc]
+            .live
+            .as_ref()
+            .is_none_or(|g| g.dead.load(Ordering::SeqCst))
+    }
+
+    /// Describe the slot as it is right now, for `krawatte status`.
+    #[allow(dead_code)] // read by the control handler, a later task
+    pub fn snapshot(&self, proc: ProcId) -> SlotInfo {
+        let p = &self.procs[proc];
+        let alive = !self.is_dead(proc);
+        SlotInfo {
+            index: proc + 1,
+            name: p.spec.name.clone(),
+            r#gen: p.r#gen,
+            pid: p.live.as_ref().filter(|_| alive).map(|g| g.pid),
+            alive,
+            command: self.current_command(proc).to_string(),
+            standard: p.spec.command.clone(),
+            kind: p.kind,
+            since: p.live.as_ref().map(|g| g.started.elapsed()),
+        }
     }
 
     /// The command the slot's current generation runs; the standard command if
@@ -456,6 +547,35 @@ impl Drop for ProcManager {
                 let _ = h.join();
             }
         }
+    }
+}
+
+/// Close out a generation whose group is gone (or abandoned): join its
+/// waiter if it has finished, mark it so nothing signals the pgid again, and
+/// describe how it ended.
+fn retire(g: &mut Generation, abandoned: bool) -> OldGen {
+    let ran = g.started.elapsed();
+    // Join only a waiter that has already published `dead`; an abandoned
+    // generation's waiter is still blocked in `wait()`.
+    if g.dead.load(Ordering::SeqCst)
+        && let Some(h) = g.waiter.take()
+    {
+        let _ = h.join();
+    }
+    // A retired-but-kept generation is skipped by global shutdown and `Drop`:
+    // its group is gone or was given up on.
+    g.finished = true;
+    let outcome = if abandoned {
+        Outcome::Abandoned
+    } else {
+        let status = *g.status.lock().unwrap();
+        Outcome::Exited(status.unwrap_or(ExitStatus::Code(-1)))
+    };
+    OldGen {
+        r#gen: g.r#gen,
+        pid: g.pid,
+        outcome,
+        ran,
     }
 }
 
@@ -1211,9 +1331,10 @@ mod tests {
         // `sh` has the default TERM disposition, so the grace period never
         // expires and the machine never escalates to KILL.
         assert_eq!(old.outcome, Outcome::Exited(ExitStatus::Signal(15)));
-        assert_eq!(t.new.r#gen, 1);
-        assert_eq!(t.new.command, cmd);
-        let new_pid = t.new.spawn.expect("respawn succeeded");
+        let new = t.new.as_ref().unwrap();
+        assert_eq!(new.r#gen, 1);
+        assert_eq!(new.command, cmd);
+        let new_pid = new.spawn.clone().expect("respawn succeeded");
         assert_ne!(new_pid, old_pid.as_raw());
         assert_eq!(t.trigger, Trigger::Key('r'));
 
@@ -1241,7 +1362,7 @@ mod tests {
         let t = tick_until_transition(&mut mgr, Duration::from_secs(2));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(t.old.unwrap().outcome, Outcome::Exited(ExitStatus::Code(3)));
-        assert_eq!(t.new.command, "exit 4");
+        assert_eq!(t.new.unwrap().command, "exit 4");
 
         wait_until_dead(&mgr);
         assert_eq!(mgr.shutdown(), vec![Some(ExitStatus::Code(4))]);
@@ -1259,9 +1380,10 @@ mod tests {
         assert!(mgr.replace(0, "whatever".to_string(), Trigger::Key('r')));
         let t = tick_until_transition(&mut mgr, Duration::from_secs(2));
         assert!(t.old.is_none());
-        assert_eq!(t.new.r#gen, 1);
+        let new = t.new.as_ref().unwrap();
+        assert_eq!(new.r#gen, 1);
         // The shell is still missing, so the respawn fails too and says why.
-        assert!(t.new.spawn.is_err());
+        assert!(new.spawn.is_err());
         assert_eq!(mgr.current_gen(0), 1);
         assert!(mgr.all_dead());
     }
@@ -1379,8 +1501,9 @@ mod tests {
         );
         let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
         assert_eq!(t.old.unwrap().r#gen, 1);
-        assert_eq!(t.new.r#gen, 2);
-        assert_eq!(t.new.command, "sleep 30");
+        let new = t.new.as_ref().unwrap();
+        assert_eq!(new.r#gen, 2);
+        assert_eq!(new.command, "sleep 30");
         assert_eq!(mgr.current_command(0), "sleep 30");
         shutdown_within(mgr, Duration::from_secs(5));
     }
@@ -1393,6 +1516,87 @@ mod tests {
         tick_until_transition(&mut mgr, Duration::from_secs(5));
         assert_eq!(mgr.current_command(0), "sleep 31");
         assert_eq!(mgr.standard_command(0), "sleep 30");
+        shutdown_within(mgr, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn override_kind_survives_r_and_is_dropped_by_kill() {
+        let (tx, _rx) = mpsc::channel();
+        let mut mgr = ProcManager::spawn_all(&["sleep 30".to_string()], &short_grace(), tx);
+        assert_eq!(mgr.kind(0), GenKind::Standard);
+        assert!(mgr.replace_with(
+            0,
+            "sleep 31".to_string(),
+            GenKind::Override,
+            Trigger::Cli("run".into())
+        ));
+        tick_until_transition(&mut mgr, Duration::from_secs(5));
+        assert!(mgr.is_override(0));
+        assert_eq!(mgr.current_command(0), "sleep 31");
+
+        // `r`: same command, still an override.
+        let cmd = mgr.current_command(0).to_string();
+        assert!(mgr.replace(0, cmd, Trigger::Key('r')));
+        tick_until_transition(&mut mgr, Duration::from_secs(5));
+        assert!(mgr.is_override(0));
+        assert_eq!(mgr.current_command(0), "sleep 31");
+
+        // `k`: back to the standard command, standard kind.
+        assert!(mgr.kill(0, Trigger::Key('k')));
+        let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
+        assert_eq!(t.new.as_ref().unwrap().command, "sleep 30");
+        assert!(!mgr.is_override(0));
+        shutdown_within(mgr, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stop_leaves_the_slot_dead_with_its_status_and_start_revives_it() {
+        let (tx, _rx) = mpsc::channel();
+        let mut mgr = ProcManager::spawn_all(&["sleep 30".to_string()], &short_grace(), tx);
+        assert!(!mgr.is_dead(0));
+        assert!(mgr.stop(0, Trigger::Cli("stop".into())));
+        assert!(!mgr.stop(0, Trigger::Cli("stop".into())), "in flight");
+        let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
+        assert!(t.new.is_none());
+        let old = t.old.unwrap();
+        assert_eq!(old.r#gen, 0);
+        assert_eq!(old.outcome, Outcome::Exited(ExitStatus::Signal(15)));
+        assert_eq!(t.trigger, Trigger::Cli("stop".into()));
+        assert!(mgr.is_dead(0));
+        assert_eq!(mgr.current_gen(0), 0, "no new generation");
+        // The dead generation stays on the slot so the final printout has its status.
+        assert!(mgr.was_started(0));
+        let info = mgr.snapshot(0);
+        assert_eq!(info.pid, None);
+        assert!(!info.alive);
+
+        assert!(mgr.replace_with(
+            0,
+            mgr.standard_command(0).to_string(),
+            GenKind::Standard,
+            Trigger::Cli("start".into())
+        ));
+        let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
+        assert_eq!(t.new.unwrap().r#gen, 1);
+        assert!(!mgr.is_dead(0));
+        assert_eq!(mgr.shutdown().len(), 1);
+    }
+
+    #[test]
+    fn snapshot_describes_the_current_generation() {
+        let (tx, rx) = mpsc::channel();
+        let mgr = ProcManager::spawn_all(&["echo $$; sleep 30".to_string()], &short_grace(), tx);
+        let pid = read_pid_line(&rx);
+        let info = mgr.snapshot(0);
+        assert_eq!(info.index, 1);
+        assert_eq!(info.name, "echo");
+        assert_eq!(info.r#gen, 0);
+        assert_eq!(info.pid, Some(pid.as_raw()));
+        assert!(info.alive);
+        assert_eq!(info.command, "echo $$; sleep 30");
+        assert_eq!(info.standard, "echo $$; sleep 30");
+        assert_eq!(info.kind, GenKind::Standard);
+        assert!(info.since.is_some());
         shutdown_within(mgr, Duration::from_secs(5));
     }
 }

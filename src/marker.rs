@@ -15,9 +15,11 @@ use crate::types::{ExitStatus, Trigger};
 pub fn restart_block(t: &Transition, clock: &str) -> Vec<String> {
     let mut lines = Vec::with_capacity(5);
 
-    let header = match &t.old {
-        Some(o) => format!("restart · gen {} → {}", o.r#gen, t.new.r#gen),
-        None => format!("start · gen {}", t.new.r#gen),
+    let header = match (&t.old, &t.new) {
+        (Some(o), Some(n)) => format!("restart · gen {} → {}", o.r#gen, n.r#gen),
+        (None, Some(n)) => format!("start · gen {}", n.r#gen),
+        (Some(o), None) => format!("stop · gen {}", o.r#gen),
+        (None, None) => "stop".to_string(),
     };
     lines.push(rule(&format!(
         "{header} · {clock} · {}",
@@ -50,17 +52,21 @@ pub fn restart_block(t: &Transition, clock: &str) -> Vec<String> {
             )));
         }
         None => {
-            let previous = t.new.r#gen.saturating_sub(1);
+            let previous = t.new.as_ref().map_or(0, |n| n.r#gen.saturating_sub(1));
             lines.push(rule(&format!("gen {previous}: never started")));
         }
     }
 
-    let n = &t.new;
-    match &n.spawn {
-        Ok(pid) => lines.push(rule(&format!("gen {}: pid {}", n.r#gen, pid))),
-        Err(e) => lines.push(rule(&format!("gen {}: spawn failed: {}", n.r#gen, e))),
+    match &t.new {
+        Some(n) => {
+            match &n.spawn {
+                Ok(pid) => lines.push(rule(&format!("gen {}: pid {}", n.r#gen, pid))),
+                Err(e) => lines.push(rule(&format!("gen {}: spawn failed: {}", n.r#gen, e))),
+            }
+            lines.push(rule(&format!("cmd: {}", n.command)));
+        }
+        None => lines.push(rule("slot stopped")),
     }
-    lines.push(rule(&format!("cmd: {}", n.command)));
     lines
 }
 
@@ -68,11 +74,14 @@ fn rule(text: &str) -> String {
     format!("── {text} ──")
 }
 
-/// Short trigger text for the header: `key r`, `key k`, `watch`.
+/// Short trigger text for the header: `key r`, `key k`, `watch`, `cli stop`,
+/// `resume`.
 fn trigger_label(trigger: &Trigger) -> String {
     match trigger {
         Trigger::Key(c) => format!("key {c}"),
         Trigger::Watch { .. } => "watch".to_string(),
+        Trigger::Cli(v) => format!("cli {v}"),
+        Trigger::Resume => "resume".to_string(),
     }
 }
 
@@ -118,7 +127,7 @@ mod tests {
         let t = Transition {
             proc: 0,
             old: Some(old(2, Outcome::Exited(ExitStatus::Signal(15)), 252)),
-            new: new(3, Ok(48213)),
+            new: Some(new(3, Ok(48213))),
             trigger: Trigger::Key('r'),
         };
         assert_eq!(
@@ -137,7 +146,7 @@ mod tests {
         let t = Transition {
             proc: 0,
             old: Some(old(2, Outcome::Exited(ExitStatus::Signal(15)), 252)),
-            new: new(3, Ok(48213)),
+            new: Some(new(3, Ok(48213))),
             trigger: Trigger::Watch {
                 paths: vec![
                     PathBuf::from("platform/server/src/main.rs"),
@@ -172,7 +181,7 @@ mod tests {
         let exit = Transition {
             proc: 0,
             old: Some(old(0, Outcome::Exited(ExitStatus::Code(101)), 3)),
-            new: new(1, Ok(1)),
+            new: Some(new(1, Ok(1))),
             trigger: Trigger::Key('r'),
         };
         assert_eq!(
@@ -182,7 +191,7 @@ mod tests {
         let abandoned = Transition {
             proc: 0,
             old: Some(old(0, Outcome::Abandoned, 7322)),
-            new: new(1, Ok(1)),
+            new: Some(new(1, Ok(1))),
             trigger: Trigger::Key('r'),
         };
         assert_eq!(
@@ -192,7 +201,7 @@ mod tests {
         let never = Transition {
             proc: 0,
             old: None,
-            new: new(1, Ok(1)),
+            new: Some(new(1, Ok(1))),
             trigger: Trigger::Key('r'),
         };
         let lines = restart_block(&never, "x");
@@ -205,7 +214,7 @@ mod tests {
         let failed = Transition {
             proc: 0,
             old: Some(old(0, Outcome::Exited(ExitStatus::Code(0)), 1)),
-            new: new(1, Err("No such file or directory".to_string())),
+            new: Some(new(1, Err("No such file or directory".to_string()))),
             trigger: Trigger::Key('r'),
         };
         assert_eq!(
@@ -222,5 +231,41 @@ mod tests {
         assert_eq!(fmt_duration(Duration::from_secs(252)), "4m12s");
         assert_eq!(fmt_duration(Duration::from_secs(3600)), "1h00m");
         assert_eq!(fmt_duration(Duration::from_secs(7322)), "2h02m");
+    }
+
+    #[test]
+    fn stop_and_cli_and_resume_triggers_render() {
+        let stopped = Transition {
+            proc: 0,
+            old: Some(old(1, Outcome::Exited(ExitStatus::Signal(15)), 1)),
+            new: None,
+            trigger: Trigger::Cli("stop".to_string()),
+        };
+        assert_eq!(
+            restart_block(&stopped, "x"),
+            vec![
+                "── stop · gen 1 · x · cli stop ──",
+                "── gen 1: pid 47105 · killed by signal 15 · ran 1s ──",
+                "── slot stopped ──",
+            ]
+        );
+        let resumed = Transition {
+            proc: 0,
+            old: Some(old(3, Outcome::Exited(ExitStatus::Code(0)), 30)),
+            new: Some(new(4, Ok(7))),
+            trigger: Trigger::Resume,
+        };
+        assert_eq!(
+            restart_block(&resumed, "x")[0],
+            "── restart · gen 3 → 4 · x · resume ──"
+        );
+        let ran = Transition {
+            trigger: Trigger::Cli("run".to_string()),
+            ..resumed
+        };
+        assert_eq!(
+            restart_block(&ran, "x")[0],
+            "── restart · gen 3 → 4 · x · cli run ──"
+        );
     }
 }

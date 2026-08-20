@@ -127,4 +127,11 @@ pub enum Trigger {
     /// A watched path changed. `paths` are project-relative and capped for
     /// display; `more` counts the ones not listed.
     Watch { paths: Vec<PathBuf>, more: usize },
+    /// A CLI verb over the control socket: `restart`, `kill`, `stop`,
+    /// `start`, `run`.
+    #[allow(dead_code)] // constructed by the control handler, a later task
+    Cli(String),
+    /// An override exited on its own; the standard command resumes.
+    #[allow(dead_code)] // constructed by the main loop's resume rule, a later task
+    Resume,
 }
