@@ -289,6 +289,17 @@ impl ProcManager {
         true
     }
 
+    /// Tear down the slot's current generation and spawn the slot's standard
+    /// command in its place. Today every generation *is* the standard command,
+    /// so this equals [`replace`](Self::replace) with the current command; it
+    /// diverges once an override can run in a slot. Returns `false`, doing
+    /// nothing, if a restart is already in flight.
+    #[allow(dead_code)] // wired into main.rs by a later task
+    pub fn kill(&mut self, proc: ProcId) -> bool {
+        let standard = self.procs[proc].standard.clone();
+        self.replace(proc, standard)
+    }
+
     /// Step every in-flight restart by one poll; spawn the next generation of
     /// each slot whose teardown completed. Returns the completed transitions in
     /// slot order. Call this from the main loop; it never blocks.
@@ -1277,5 +1288,24 @@ mod tests {
         assert!(seqs.windows(2).all(|w| w[0] < w[1]));
         // The initial spawn is generation 0; restarts count up from there.
         assert!(gens.iter().all(|&g| g == 0));
+    }
+
+    #[test]
+    fn kill_respawns_the_standard_command() {
+        let (tx, _rx) = mpsc::channel();
+        let mut mgr = ProcManager::spawn_all(&["sleep 30".to_string()], &short_grace(), tx);
+        // Run something else in the slot, as a future override would.
+        assert!(mgr.replace(0, "sleep 31".to_string()));
+        tick_until_transition(&mut mgr, Duration::from_secs(5));
+        assert_eq!(mgr.current_command(0), "sleep 31");
+
+        assert!(mgr.kill(0));
+        assert!(!mgr.kill(0), "kill while in flight is ignored");
+        let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
+        assert_eq!(t.old.unwrap().r#gen, 1);
+        assert_eq!(t.new.r#gen, 2);
+        assert_eq!(t.new.command, "sleep 30");
+        assert_eq!(mgr.current_command(0), "sleep 30");
+        shutdown_within(mgr, Duration::from_secs(5));
     }
 }
