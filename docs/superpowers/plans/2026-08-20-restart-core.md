@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, `nix` (killpg/setpgid), `ratatui`/`crossterm`, `jiff`. Tests are plain `#[test]`s; process tests use real `sh` children as the existing `proc.rs` tests do.
 
-**Spec:** `docs/superpowers/specs/2026-08-20-restart-core-design.md`. One naming deviation: the spec calls `tick`'s return type `Respawned`; this plan names it `Transition` because `k` with `OnExit::StayDead` completes without a respawn, and the record covers that case too.
+**Spec:** `docs/superpowers/specs/2026-08-20-restart-core-design.md`. One naming deviation: the spec calls `tick`'s return type `Respawned`; this plan names it `Transition` (old generation → new generation) so spec C can extend it with a trigger field without the name reading oddly.
 
 ## Global Constraints
 
@@ -27,7 +27,7 @@
 | File | Responsibility after this plan |
 |---|---|
 | `src/types.rs` | Adds `Gen`, `StreamTag::Marker`, `Health::Restarting`; `gen` field on every `Event` variant. |
-| `src/proc.rs` | `Generation` / `Proc` split; `OnExit`, `Restart`, `Transition`, `OldGen`, `NewGen`, `Outcome`; `replace`, `kill`, `tick`, `is_current`, `is_restarting`, `current_command`, `current_gen`, `next_seq`. Shutdown machine untouched. |
+| `src/proc.rs` | `Generation` / `Proc` split; `Restart`, `Transition`, `OldGen`, `NewGen`, `Outcome`; `replace`, `kill`, `tick`, `is_current`, `is_restarting`, `current_command`, `current_gen`, `next_seq`. Shutdown machine untouched. |
 | `src/marker.rs` (new) | Pure text formatting of the restart marker block from a `Transition`. |
 | `src/buffer.rs` | `StyledLine::marker` constructor. |
 | `src/ui.rs` | `r`/`k` key mapping, `Action::Restart`/`Kill`, `↻` glyph, dim rendering of `Marker` lines, `clock()` and `health()` accessors. |
@@ -483,13 +483,12 @@ git commit -m "Split Proc into slot and Generation"
 **Interfaces:**
 - Produces:
   ```rust
-  pub enum OnExit { StayDead, SpawnStandard }
   pub enum Outcome { Exited(ExitStatus), Abandoned }
   pub struct OldGen { pub gen: Gen, pub pid: i32, pub outcome: Outcome, pub ran: Duration }
   pub struct NewGen { pub gen: Gen, pub command: String, pub spawn: Result<i32, String> }
-  pub struct Transition { pub proc: ProcId, pub old: Option<OldGen>, pub new: Option<NewGen> }
+  pub struct Transition { pub proc: ProcId, pub old: Option<OldGen>, pub new: NewGen }
   impl ProcManager {
-      pub fn replace(&mut self, proc: ProcId, command: String, on_exit: OnExit) -> bool;
+      pub fn replace(&mut self, proc: ProcId, command: String) -> bool;
       pub fn tick(&mut self) -> Vec<Transition>;
       pub fn current_gen(&self, proc: ProcId) -> Gen;
       pub fn is_current(&self, proc: ProcId, gen: Gen) -> bool;
@@ -531,10 +530,10 @@ Add to the `tests` module in `src/proc.rs`, after `read_pid_line`:
         let mut mgr = ProcManager::spawn_all(std::slice::from_ref(&cmd), &short_grace(), tx);
         let old_pid = read_pid_line(&rx);
 
-        assert!(mgr.replace(0, cmd.clone(), OnExit::SpawnStandard));
+        assert!(mgr.replace(0, cmd.clone()));
         assert!(mgr.is_restarting(0));
         // A second request while one is in flight is ignored.
-        assert!(!mgr.replace(0, cmd.clone(), OnExit::SpawnStandard));
+        assert!(!mgr.replace(0, cmd.clone()));
 
         let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
         assert_eq!(t.proc, 0);
@@ -544,10 +543,9 @@ Add to the `tests` module in `src/proc.rs`, after `read_pid_line`:
         // `sh` has the default TERM disposition, so the grace period never
         // expires and the machine never escalates to KILL.
         assert_eq!(old.outcome, Outcome::Exited(ExitStatus::Signal(15)));
-        let new = t.new.expect("slot was respawned");
-        assert_eq!(new.gen, 1);
-        assert_eq!(new.command, cmd);
-        let new_pid = new.spawn.expect("respawn succeeded");
+        assert_eq!(t.new.gen, 1);
+        assert_eq!(t.new.command, cmd);
+        let new_pid = t.new.spawn.expect("respawn succeeded");
         assert_ne!(new_pid, old_pid.as_raw());
 
         assert!(group_gone(old_pid));
@@ -570,11 +568,11 @@ Add to the `tests` module in `src/proc.rs`, after `read_pid_line`:
         wait_until_dead(&mgr);
 
         let started = Instant::now();
-        assert!(mgr.replace(0, "exit 4".to_string(), OnExit::SpawnStandard));
+        assert!(mgr.replace(0, "exit 4".to_string()));
         let t = tick_until_transition(&mut mgr, Duration::from_secs(2));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(t.old.unwrap().outcome, Outcome::Exited(ExitStatus::Code(3)));
-        assert_eq!(t.new.unwrap().command, "exit 4");
+        assert_eq!(t.new.command, "exit 4");
 
         wait_until_dead(&mgr);
         assert_eq!(mgr.shutdown(), vec![Some(ExitStatus::Code(4))]);
@@ -589,13 +587,12 @@ Add to the `tests` module in `src/proc.rs`, after `read_pid_line`:
             tx,
             "/nonexistent/krawatte-no-such-shell",
         );
-        assert!(mgr.replace(0, "whatever".to_string(), OnExit::SpawnStandard));
+        assert!(mgr.replace(0, "whatever".to_string()));
         let t = tick_until_transition(&mut mgr, Duration::from_secs(2));
         assert!(t.old.is_none());
-        let new = t.new.unwrap();
-        assert_eq!(new.gen, 1);
+        assert_eq!(t.new.gen, 1);
         // The shell is still missing, so the respawn fails too and says why.
-        assert!(new.spawn.is_err());
+        assert!(t.new.spawn.is_err());
         assert_eq!(mgr.current_gen(0), 1);
         assert!(mgr.all_dead());
     }
@@ -609,7 +606,7 @@ Add to the `tests` module in `src/proc.rs`, after `read_pid_line`:
         let bg = read_pid_line(&rx);
         assert!(nix::sys::signal::kill(bg, None).is_ok());
 
-        assert!(mgr.replace(0, "true".to_string(), OnExit::SpawnStandard));
+        assert!(mgr.replace(0, "true".to_string()));
         tick_until_transition(&mut mgr, Duration::from_secs(5));
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -630,7 +627,7 @@ Add to the `tests` module in `src/proc.rs`, after `read_pid_line`:
         let mut mgr = ProcManager::spawn_all(std::slice::from_ref(&cmd), &short_grace(), tx);
         // Give `sh` a moment to install the trap before TERM arrives.
         std::thread::sleep(Duration::from_millis(100));
-        assert!(mgr.replace(0, cmd, OnExit::SpawnStandard));
+        assert!(mgr.replace(0, cmd));
         // One step: TERM has been sent, the grace clock is running.
         assert!(mgr.tick().is_empty());
         assert!(mgr.is_restarting(0));
@@ -658,34 +655,21 @@ Add to the `tests` module in `src/proc.rs`, after `read_pid_line`:
 - [ ] **Step 2: Run them to verify they fail to compile**
 
 Run: `cargo test -q restart_`
-Expected: compile errors — `OnExit`, `Transition`, `replace`, `tick` not found.
+Expected: compile errors — `Transition`, `replace`, `tick` not found.
 
 - [ ] **Step 3: Add the types**
 
 In `src/proc.rs`, directly after `struct Proc { … }`:
 
 ```rust
-/// What a slot does once its current generation has been killed via
-/// [`ProcManager::kill`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OnExit {
-    /// Leave the slot stopped.
-    StayDead,
-    /// Respawn the slot's standard command.
-    SpawnStandard,
-}
-
 /// An in-flight restart: the teardown of the current generation, and what to
 /// run once it is gone.
 struct Restart {
     /// Single-slot TERM -> grace -> KILL machine; starts `Done` if there was
     /// nothing to tear down.
     machine: ShutdownMachine,
-    /// Command to spawn once the old generation is gone; `None` leaves the
-    /// slot stopped.
-    next: Option<String>,
-    /// Policy the new generation gets.
-    on_exit: OnExit,
+    /// Command to spawn once the old generation is gone.
+    next: String,
 }
 
 /// How a generation ended.
@@ -724,21 +708,18 @@ pub struct Transition {
     pub proc: ProcId,
     /// `None` when the slot had no generation to end (it never started).
     pub old: Option<OldGen>,
-    /// `None` when the slot was left stopped ([`OnExit::StayDead`]).
-    pub new: Option<NewGen>,
+    pub new: NewGen,
 }
 ```
 
-Add two fields to `Proc` (after `live`):
+Add one field to `Proc` (after `live`):
 
 ```rust
     /// Teardown in progress, if any. A slot has at most one.
     restart: Option<Restart>,
-    /// What [`ProcManager::kill`] does to the current generation.
-    on_exit: OnExit,
 ```
 
-and initialise them in `spawn_all_with_shell`: `restart: None, on_exit: OnExit::SpawnStandard,`.
+and initialise it in `spawn_all_with_shell`: `restart: None,`.
 
 - [ ] **Step 4: Add the manager methods**
 
@@ -746,14 +727,10 @@ In `impl ProcManager`, after `short_name`:
 
 ```rust
     /// Tear down the slot's current generation (if any is still around), then
-    /// spawn `command` in its place; `on_exit` becomes the new generation's
-    /// policy. Non-blocking: the teardown is driven by [`tick`](Self::tick).
-    /// Returns `false`, doing nothing, if a restart is already in flight.
-    pub fn replace(&mut self, proc: ProcId, command: String, on_exit: OnExit) -> bool {
-        self.begin(proc, Some(command), on_exit)
-    }
-
-    fn begin(&mut self, proc: ProcId, next: Option<String>, on_exit: OnExit) -> bool {
+    /// spawn `command` in its place. Non-blocking: the teardown is driven by
+    /// [`tick`](Self::tick). Returns `false`, doing nothing, if a restart is
+    /// already in flight.
+    pub fn replace(&mut self, proc: ProcId, command: String) -> bool {
         let slot = &mut self.procs[proc];
         if slot.restart.is_some() {
             return false;
@@ -774,8 +751,7 @@ In `impl ProcManager`, after `short_name`:
         };
         slot.restart = Some(Restart {
             machine: ShutdownMachine::new(to_kill, self.grace_period),
-            next,
-            on_exit,
+            next: command,
         });
         true
     }
@@ -824,31 +800,29 @@ In `impl ProcManager`, after `short_name`:
                 ran,
             }
         });
-        let new = restart.next.map(|command| {
-            let gen = self.procs[proc].gen + 1;
-            self.procs[proc].gen = gen;
-            let spawn = match spawn_one(proc, gen, &self.shell, &command, &self.seq, &self.tx) {
-                Ok(g) => {
-                    let pid = g.pid;
-                    self.procs[proc].live = Some(g);
-                    Ok(pid)
-                }
-                Err(e) => {
-                    let _ = self.tx.send(Event::SpawnFailed {
-                        proc,
-                        gen,
-                        error: e.to_string(),
-                    });
-                    Err(e.to_string())
-                }
-            };
-            NewGen {
-                gen,
-                command,
-                spawn,
+        let command = restart.next;
+        let gen = self.procs[proc].gen + 1;
+        self.procs[proc].gen = gen;
+        let spawn = match spawn_one(proc, gen, &self.shell, &command, &self.seq, &self.tx) {
+            Ok(g) => {
+                let pid = g.pid;
+                self.procs[proc].live = Some(g);
+                Ok(pid)
             }
-        });
-        self.procs[proc].on_exit = restart.on_exit;
+            Err(e) => {
+                let _ = self.tx.send(Event::SpawnFailed {
+                    proc,
+                    gen,
+                    error: e.to_string(),
+                });
+                Err(e.to_string())
+            }
+        };
+        let new = NewGen {
+            gen,
+            command,
+            spawn,
+        };
         Transition { proc, old, new }
     }
 
@@ -897,7 +871,7 @@ At the top of `shutdown`, before computing `live`, abandon any in-flight restart
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test -q && cargo clippy --all-targets -q`
-Expected: 75 passed, no warnings. (`OnExit::StayDead` and `Proc::on_exit` are read in Task 4; if clippy complains about `StayDead` being unconstructed, add `#[allow(dead_code)]` to the variant and remove it in Task 4.)
+Expected: 75 passed, no warnings.
 
 If `restart_of_live_slot_spawns_a_new_pid_in_the_same_slot` reports `Outcome::Exited(Code(143))` instead of `Signal(15)`, the system `sh` is one that reports a terminated foreground child as exit 128+n instead of dying itself; accept either with `assert!(matches!(old.outcome, Outcome::Exited(ExitStatus::Signal(15) | ExitStatus::Code(143))))`.
 
@@ -910,24 +884,24 @@ git commit -m "Add non-blocking per-slot restart primitive"
 
 ---
 
-### Task 4: `kill` and the `OnExit` policy
+### Task 4: `kill` returns a slot to its standard command
 
 **Files:**
-- Modify: `src/proc.rs` (one method, two tests)
+- Modify: `src/proc.rs` (one method, one test)
 
 **Interfaces:**
 - Produces: `pub fn kill(&mut self, proc: ProcId) -> bool`.
-- Consumes: Task 3's `begin`, `Proc::on_exit`, `tick_until_transition`, `short_grace`.
+- Consumes: Task 3's `replace`, `tick_until_transition`, `short_grace`.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the failing test**
 
 ```rust
     #[test]
-    fn kill_with_spawn_standard_policy_resumes_the_standard_command() {
+    fn kill_respawns_the_standard_command() {
         let (tx, _rx) = mpsc::channel();
         let mut mgr = ProcManager::spawn_all(&["sleep 30".to_string()], &short_grace(), tx);
         // Run something else in the slot, as a future override would.
-        assert!(mgr.replace(0, "sleep 31".to_string(), OnExit::SpawnStandard));
+        assert!(mgr.replace(0, "sleep 31".to_string()));
         tick_until_transition(&mut mgr, Duration::from_secs(5));
         assert_eq!(mgr.current_command(0), "sleep 31");
 
@@ -935,36 +909,16 @@ git commit -m "Add non-blocking per-slot restart primitive"
         assert!(!mgr.kill(0), "kill while in flight is ignored");
         let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
         assert_eq!(t.old.unwrap().gen, 1);
-        let new = t.new.expect("standard command respawned");
-        assert_eq!(new.gen, 2);
-        assert_eq!(new.command, "sleep 30");
+        assert_eq!(t.new.gen, 2);
+        assert_eq!(t.new.command, "sleep 30");
         assert_eq!(mgr.current_command(0), "sleep 30");
         shutdown_within(mgr, Duration::from_secs(5));
     }
-
-    #[test]
-    fn kill_with_stay_dead_policy_leaves_the_slot_stopped() {
-        let (tx, _rx) = mpsc::channel();
-        let mut mgr = ProcManager::spawn_all(&["sleep 30".to_string()], &short_grace(), tx);
-        assert!(mgr.replace(0, "sleep 31".to_string(), OnExit::StayDead));
-        tick_until_transition(&mut mgr, Duration::from_secs(5));
-
-        assert!(mgr.kill(0));
-        let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
-        assert_eq!(t.old.unwrap().gen, 1);
-        assert!(t.new.is_none());
-        // No new generation: the counter stays, the slot is simply dead.
-        assert_eq!(mgr.current_gen(0), 1);
-        assert!(mgr.all_dead());
-        assert_eq!(mgr.shutdown(), vec![None]);
-    }
 ```
 
-Note on the last assertion: after a stay-dead kill the slot's `live` is `None` (the old generation was retired by `complete`), so `shutdown` reports `None` and `main`'s final printout says "did not start". That mislabel is acceptable until spec C actually exposes `StayDead`; it is not reachable from any key in this spec.
+- [ ] **Step 2: Run it to verify it fails**
 
-- [ ] **Step 2: Run them to verify they fail**
-
-Run: `cargo test -q kill_with`
+Run: `cargo test -q kill_respawns`
 Expected: compile error — no method `kill`.
 
 - [ ] **Step 3: Implement `kill`**
@@ -972,30 +926,27 @@ Expected: compile error — no method `kill`.
 After `replace` in `impl ProcManager`:
 
 ```rust
-    /// Tear down the slot's current generation and apply its [`OnExit`]
-    /// policy: respawn the standard command, or leave the slot stopped. The
-    /// generation that follows always runs with [`OnExit::SpawnStandard`].
-    /// Returns `false`, doing nothing, if a restart is already in flight.
+    /// Tear down the slot's current generation and spawn the slot's standard
+    /// command in its place. Today every generation *is* the standard command,
+    /// so this equals [`replace`](Self::replace) with the current command; it
+    /// diverges once an override can run in a slot. Returns `false`, doing
+    /// nothing, if a restart is already in flight.
     pub fn kill(&mut self, proc: ProcId) -> bool {
-        let slot = &self.procs[proc];
-        let next = match slot.on_exit {
-            OnExit::SpawnStandard => Some(slot.standard.clone()),
-            OnExit::StayDead => None,
-        };
-        self.begin(proc, next, OnExit::SpawnStandard)
+        let standard = self.procs[proc].standard.clone();
+        self.replace(proc, standard)
     }
 ```
 
 - [ ] **Step 4: Run the suite**
 
 Run: `cargo test -q && cargo clippy --all-targets -q`
-Expected: 77 passed, no warnings.
+Expected: 76 passed, no warnings.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/proc.rs
-git commit -m "Add kill with on-exit policy to ProcManager"
+git commit -m "Add kill to ProcManager"
 ```
 
 ---
@@ -1055,7 +1006,7 @@ mod tests {
         let t = Transition {
             proc: 0,
             old: Some(old(2, Outcome::Exited(ExitStatus::Signal(15)), 252)),
-            new: Some(new(3, Ok(48213))),
+            new: new(3, Ok(48213)),
         };
         assert_eq!(
             restart_block(&t, "14:02:11"),
@@ -1073,7 +1024,7 @@ mod tests {
         let exit = Transition {
             proc: 0,
             old: Some(old(0, Outcome::Exited(ExitStatus::Code(101)), 3)),
-            new: Some(new(1, Ok(1))),
+            new: new(1, Ok(1)),
         };
         assert_eq!(
             restart_block(&exit, "x")[1],
@@ -1082,7 +1033,7 @@ mod tests {
         let abandoned = Transition {
             proc: 0,
             old: Some(old(0, Outcome::Abandoned, 7322)),
-            new: Some(new(1, Ok(1))),
+            new: new(1, Ok(1)),
         };
         assert_eq!(
             restart_block(&abandoned, "x")[1],
@@ -1091,7 +1042,7 @@ mod tests {
         let never = Transition {
             proc: 0,
             old: None,
-            new: Some(new(1, Ok(1))),
+            new: new(1, Ok(1)),
         };
         let lines = restart_block(&never, "x");
         assert_eq!(lines[0], "── start · gen 1 · x ──");
@@ -1099,28 +1050,15 @@ mod tests {
     }
 
     #[test]
-    fn restart_block_reports_spawn_failure_and_stop() {
+    fn restart_block_reports_spawn_failure() {
         let failed = Transition {
             proc: 0,
             old: Some(old(0, Outcome::Exited(ExitStatus::Code(0)), 1)),
-            new: Some(new(1, Err("No such file or directory".to_string()))),
+            new: new(1, Err("No such file or directory".to_string())),
         };
         assert_eq!(
             restart_block(&failed, "x")[2],
             "── gen 1: spawn failed: No such file or directory ──"
-        );
-        let stopped = Transition {
-            proc: 0,
-            old: Some(old(1, Outcome::Exited(ExitStatus::Signal(15)), 1)),
-            new: None,
-        };
-        assert_eq!(
-            restart_block(&stopped, "x"),
-            vec![
-                "── stop · gen 1 · x ──",
-                "── gen 1: pid 47105 · killed by signal 15 · ran 1s ──",
-                "── slot stopped ──",
-            ]
         );
     }
 
@@ -1154,11 +1092,9 @@ Insert between the `use` lines and the `tests` module in `src/marker.rs`:
 pub fn restart_block(t: &Transition, clock: &str) -> Vec<String> {
     let mut lines = Vec::with_capacity(4);
 
-    let header = match (&t.old, &t.new) {
-        (Some(o), Some(n)) => format!("restart · gen {} → {}", o.gen, n.gen),
-        (None, Some(n)) => format!("start · gen {}", n.gen),
-        (Some(o), None) => format!("stop · gen {}", o.gen),
-        (None, None) => "stop".to_string(),
+    let header = match &t.old {
+        Some(o) => format!("restart · gen {} → {}", o.gen, t.new.gen),
+        None => format!("start · gen {}", t.new.gen),
     };
     lines.push(rule(&format!("{header} · {clock}")));
 
@@ -1178,21 +1114,17 @@ pub fn restart_block(t: &Transition, clock: &str) -> Vec<String> {
             )));
         }
         None => {
-            let gen = t.new.as_ref().map_or(0, |n| n.gen.saturating_sub(1));
+            let gen = t.new.gen.saturating_sub(1);
             lines.push(rule(&format!("gen {gen}: never started")));
         }
     }
 
-    match &t.new {
-        Some(n) => {
-            match &n.spawn {
-                Ok(pid) => lines.push(rule(&format!("gen {}: pid {}", n.gen, pid))),
-                Err(e) => lines.push(rule(&format!("gen {}: spawn failed: {}", n.gen, e))),
-            }
-            lines.push(rule(&format!("cmd: {}", n.command)));
-        }
-        None => lines.push(rule("slot stopped")),
+    let n = &t.new;
+    match &n.spawn {
+        Ok(pid) => lines.push(rule(&format!("gen {}: pid {}", n.gen, pid))),
+        Err(e) => lines.push(rule(&format!("gen {}: spawn failed: {}", n.gen, e))),
     }
+    lines.push(rule(&format!("cmd: {}", n.command)));
     lines
 }
 
@@ -1319,7 +1251,7 @@ Remove the `#[allow(dead_code)]` you put on `StreamTag::Marker` in Task 1.
 - [ ] **Step 8: Run the suite**
 
 Run: `cargo test -q && cargo clippy --all-targets -q`
-Expected: 84 passed, no warnings. (`restart_block` and `StyledLine::marker` have no non-test caller until Task 7; if clippy flags them, add `#[allow(dead_code)]` and remove it in Task 7.)
+Expected: 83 passed, no warnings. (`restart_block` and `StyledLine::marker` have no non-test caller until Task 7; if clippy flags them, add `#[allow(dead_code)]` and remove it in Task 7.)
 
 - [ ] **Step 9: Commit**
 
@@ -1454,7 +1386,7 @@ Remove the `#[allow(dead_code)]` from `Health::Restarting` (Task 1).
 - [ ] **Step 4: Run the suite**
 
 Run: `cargo test -q && cargo clippy --all-targets -q`
-Expected: 87 passed. If clippy flags `UiState::health` as unused outside tests, leave it — Task 7's main test uses it; add a temporary `#[allow(dead_code)]` only if the warning blocks you and remove it in Task 7.
+Expected: 86 passed. If clippy flags `UiState::health` as unused outside tests, leave it — Task 7's main test uses it; add a temporary `#[allow(dead_code)]` only if the warning blocks you and remove it in Task 7.
 
 - [ ] **Step 5: Commit**
 
@@ -1472,14 +1404,13 @@ git commit -m "Add r and k hotkeys and the restarting health glyph"
 - Modify: `README.md`
 
 **Interfaces:**
-- Consumes: `ProcManager::{replace, kill, tick, is_current, is_restarting, current_command, next_seq}`, `OnExit`, `Transition`, `NewGen`, `Outcome`, `marker::restart_block`, `StyledLine::marker`, `UiState::{clock, health}`, `Action::{Restart, Kill}`.
+- Consumes: `ProcManager::{replace, kill, tick, is_current, is_restarting, current_command, next_seq}`, `Transition`, `marker::restart_block`, `StyledLine::marker`, `UiState::{clock, health}`, `Action::{Restart, Kill}`.
 
 - [ ] **Step 1: Write the failing test**
 
 In `src/main.rs` `mod tests`:
 
 ```rust
-    use crate::proc::OnExit;
     use crate::types::{Gen, StreamTag};
     use std::sync::mpsc;
     use std::time::{Instant, SystemTime};
@@ -1506,7 +1437,7 @@ In `src/main.rs` `mod tests`:
         let mut buffers = BufferSet::new(1, &config);
         let mut ui = UiState::new(vec!["sleep".to_string()]);
 
-        assert!(manager.replace(0, "sleep 30".to_string(), OnExit::SpawnStandard));
+        assert!(manager.replace(0, "sleep 30".to_string()));
         ui.set_health(0, Health::Restarting);
 
         // Mid-teardown: output from the dying generation is still shown, but
@@ -1565,7 +1496,7 @@ Imports at the top of `src/main.rs`:
 
 ```rust
 use crate::buffer::{BufferSet, StyledLine};
-use crate::proc::{NewGen, OnExit, Outcome, ProcManager, Transition};
+use crate::proc::{ProcManager, Transition};
 use crate::types::{Config, Event, ExitStatus, Health};
 use crate::ui::{Action, UiState};
 ```
@@ -1583,7 +1514,7 @@ Replace the key-handling `if` in `event_loop` and add the tick:
                 Action::Quit => return Ok(()),
                 Action::Restart(p) => {
                     let command = manager.current_command(p).to_string();
-                    if manager.replace(p, command, OnExit::SpawnStandard) {
+                    if manager.replace(p, command) {
                         ui.set_health(p, Health::Restarting);
                     }
                 }
@@ -1659,16 +1590,9 @@ fn apply_transition(
     for text in marker::restart_block(t, &ui.clock(at)) {
         buffers.push(StyledLine::marker(t.proc, manager.next_seq(), at, text));
     }
-    let health = match (&t.new, &t.old) {
-        (Some(NewGen { spawn: Ok(_), .. }), _) => Health::Running,
-        (Some(NewGen { spawn: Err(_), .. }), _) => Health::SpawnFailed,
-        // Left stopped: show how the last generation ended. An abandoned one
-        // was sent SIGKILL, which is the closest status the bar can express.
-        (None, Some(old)) => match old.outcome {
-            Outcome::Exited(status) => health_from_exit(status),
-            Outcome::Abandoned => Health::ExitedErr(ExitStatus::Signal(9)),
-        },
-        (None, None) => Health::SpawnFailed,
+    let health = match t.new.spawn {
+        Ok(_) => Health::Running,
+        Err(_) => Health::SpawnFailed,
     };
     ui.set_health(t.proc, health);
 }
@@ -1681,7 +1605,7 @@ Remove any temporary `#[allow(dead_code)]` added in Tasks 5 and 6.
 - [ ] **Step 4: Run the suite and clippy**
 
 Run: `cargo test -q && cargo clippy --all-targets -q`
-Expected: 88 passed, no warnings.
+Expected: 87 passed, no warnings.
 
 - [ ] **Step 5: Manual smoke test**
 
@@ -1735,13 +1659,13 @@ git commit -m "Add per-slot restart with r and k hotkeys"
 - Dead / never-started slot restarts immediately → Task 3 (`begin` marks finished, machine starts `Done`; tests for both).
 - No crash-restart → nothing consults `on_exit` on self-exit; `drain_events` only sets health.
 - `↻` health, old exit never shows as `✖` → Task 6 glyph; Task 7 `is_restarting` filter, tested.
-- Marker block with every outcome, one topic per line → Task 5, tested for exit/signal/abandoned/never started/spawn failed/stop.
+- Marker block with every outcome, one topic per line → Task 5, tested for exit/signal/abandoned/never started/spawn failed.
 - Generations on events, stale drop → Tasks 1, 3, 7 (tested in `proc.rs` via `is_current` and in `main.rs` end to end).
 - Invariant "one live generation per slot", `q` mid-restart bounded → Task 3 (`complete` takes `live` before spawning; `shutdown` clears `restart`; test `shutdown_started_mid_restart_returns_within_the_bound`).
 - Abandoned groups don't hang a restart → inherited from `ShutdownMachine`'s `KILL_REAP_TIMEOUT`; `complete` handles `abandoned()`.
 - Background job in old group killed by restart → Task 3 test.
-- `Respawned` → named `Transition`; noted in the header.
+- `Respawned` → named `Transition`; noted in the header. `k` = kill + spawn standard (Task 4), no policy enum.
 
 **Placeholder scan.** None.
 
-**Type consistency.** `Transition { proc, old: Option<OldGen>, new: Option<NewGen> }`, `NewGen.spawn: Result<i32, String>`, `OldGen.ran: Duration`, `Outcome::{Exited(ExitStatus), Abandoned}` used identically in Tasks 3, 5, 7. `replace(proc, String, OnExit) -> bool`, `kill(proc) -> bool`, `tick() -> Vec<Transition>` consistent across Tasks 3, 4, 7. `UiState::clock(SystemTime) -> String` and `health(ProcId) -> Health` defined in Tasks 5/6, used in Task 7.
+**Type consistency.** `Transition { proc, old: Option<OldGen>, new: NewGen }`, `NewGen.spawn: Result<i32, String>`, `OldGen.ran: Duration`, `Outcome::{Exited(ExitStatus), Abandoned}` used identically in Tasks 3, 5, 7. `replace(proc, String) -> bool`, `kill(proc) -> bool`, `tick() -> Vec<Transition>` consistent across Tasks 3, 4, 7. `UiState::clock(SystemTime) -> String` and `health(ProcId) -> Health` defined in Tasks 5/6, used in Task 7.

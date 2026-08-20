@@ -20,10 +20,11 @@ callers now even though this spec only wires the two hotkeys.
 - `r` in a single pane restarts that slot: TERM → grace → KILL the current
   generation, then spawn the same command again. The grace period is the
   existing `--timeout`.
-- `k` in a single pane kills the current generation and applies its on-exit
-  policy. In this spec every generation is a standard run, whose policy after
-  an explicit kill is "respawn", so `k` and `r` behave identically; they
-  diverge once overrides exist (see below).
+- `k` in a single pane kills the current generation and spawns the slot's
+  *standard* command (the one from the CLI/Krawattefile). In this spec every
+  generation runs the standard command, so `k` and `r` behave identically;
+  they diverge once overrides exist: `r` restarts whatever is running, `k`
+  always returns the slot to its standard command.
 - Both keys are silent no-ops in the all-view and while a restart is already
   in flight for that slot.
 - Restarting a slot that is already dead — exited on its own, or never spawned
@@ -72,7 +73,6 @@ struct Proc {
     gen: u32,                    // current generation number
     live: Option<Generation>,    // None once confirmed gone or never spawned
     restart: Option<Restart>,    // in-flight teardown, see below
-    on_exit: OnExit,             // policy for the current generation
 }
 ```
 
@@ -91,35 +91,31 @@ sees whatever pgid the slot currently holds.
 ### The restart primitive
 
 ```
-pub enum OnExit { StayDead, SpawnStandard }
-
 impl ProcManager {
     /// Tear down the current generation (if alive) and then spawn `command`
     /// in this slot. No-op if a restart is already in flight.
-    pub fn replace(&mut self, proc: ProcId, command: String, on_exit: OnExit);
-    /// Tear down the current generation and let its `on_exit` policy decide
-    /// what runs next.
-    pub fn kill(&mut self, proc: ProcId);
+    pub fn replace(&mut self, proc: ProcId, command: String) -> bool;
+    /// Tear down the current generation and spawn the slot's standard
+    /// command. Equivalent to `replace(proc, standard)`.
+    pub fn kill(&mut self, proc: ProcId) -> bool;
     /// Step every in-flight restart; spawn new generations whose teardown
     /// completed. Returns the slots that were respawned this tick so the
-    /// caller can append separators and update health.
+    /// caller can append markers and update health.
     pub fn tick(&mut self) -> Vec<Respawned>;
 }
 ```
 
-`r` = `replace(p, current_command, current_on_exit)`. `k` = `kill(p)`. In
-this spec the only policy is `SpawnStandard` for explicitly killed standard
-runs, so `kill` on a standard run is `replace(p, standard, SpawnStandard)`.
-The override (spec C) will call `replace(p, wrapped, SpawnStandard)` and set
-the slot's policy so that `kill` resumes the standard command instead; the
-self-exit path will also consult `on_exit` then. `StayDead` is listed now so
-the enum is complete; this spec's callers never pass it.
+`r` = `replace(p, current_command)`. `k` = `kill(p)`. Spec C will add a
+per-slot generation kind (standard or override) so that an override's
+*self-exit* resumes the standard command and watch events leave it alone;
+nothing in this spec consults a policy on self-exit — a generation that exits
+on its own stays dead.
 
 ### Non-blocking teardown
 
 `Restart` holds a single-process `ShutdownMachine` — the existing state
 machine that global shutdown uses, with the same `ShutdownEffects` trait and
-the same grace — plus the command and policy to apply when it finishes. The
+the same grace — plus the command to spawn when it finishes. The
 main loop already wakes every 50 ms; it calls `manager.tick()` after draining
 events. `tick` steps each machine with the real effects; when a machine
 reports done (group gone, or abandoned after SIGKILL failed) the slot's old
@@ -166,5 +162,5 @@ the manager.
 
 ## Out of scope
 
-Overrides' trigger and the `OnExit` divergence of `k` (spec C), file watching
-(spec D), any change to the buffer cap or storage.
+Overrides (their trigger, the generation kind, and resume-on-self-exit: spec
+C), file watching (spec D), any change to the buffer cap or storage.
