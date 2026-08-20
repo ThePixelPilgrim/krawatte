@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -267,6 +268,34 @@ pub fn parse(
     }
 }
 
+/// The nearest `Krawattefile` in `start` or any of its parents, like `git`
+/// finds `.git`. A directory by that name does not count.
+pub fn discover(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .map(|dir| dir.join(FILE_NAME))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Read and parse the file at `path`. The project dir is the file's
+/// (canonical) parent; `path` itself is kept as given for messages.
+pub fn load(path: &Path) -> Result<Krawattefile, Vec<ConfigError>> {
+    let unreadable = |e: std::io::Error| {
+        vec![ConfigError {
+            path: path.to_path_buf(),
+            line: None,
+            message: format!("cannot read: {e}"),
+        }]
+    };
+    let text = fs::read_to_string(path).map_err(unreadable)?;
+    let canonical = path.canonicalize().map_err(unreadable)?;
+    let project_dir = canonical
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    parse(&text, path, &project_dir)
+}
+
 /// Why a proc name is unacceptable, phrased to follow `proc name "x" …`.
 fn name_problem(name: &str) -> Option<&'static str> {
     if name == "all" {
@@ -300,8 +329,6 @@ pub fn short_name_of(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
 
     fn parse_in(dir: &Path, text: &str) -> Result<Krawattefile, Vec<ConfigError>> {
@@ -548,5 +575,65 @@ cmd = "x"
         assert_eq!(short_name_of("/usr/bin/python worker.py"), "python");
         assert_eq!(short_name_of("npm run dev"), "npm");
         assert_eq!(short_name_of(""), "");
+    }
+
+    #[test]
+    fn discover_walks_up_and_prefers_the_nearest_file() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let deep = project.join("a").join("b");
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(discover(&deep), None);
+
+        fs::write(project.join(FILE_NAME), "").unwrap();
+        assert_eq!(discover(&deep), Some(project.join(FILE_NAME)));
+        assert_eq!(discover(&project), Some(project.join(FILE_NAME)));
+
+        // A nearer file shadows the outer one.
+        fs::write(project.join("a").join(FILE_NAME), "").unwrap();
+        assert_eq!(discover(&deep), Some(project.join("a").join(FILE_NAME)));
+    }
+
+    #[test]
+    fn discover_ignores_a_directory_named_like_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(FILE_NAME)).unwrap();
+        assert_eq!(discover(root.path()), None);
+    }
+
+    #[test]
+    fn load_reads_the_file_and_resolves_the_project_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir_all(project.join("frontend")).unwrap();
+        let file = project.join(FILE_NAME);
+        fs::write(
+            &file,
+            "[[proc]]\nname = \"web\"\ncmd = \"npm run dev\"\ncwd = \"frontend\"\n",
+        )
+        .unwrap();
+
+        let kf = load(&file).unwrap();
+        let canon = project.canonicalize().unwrap();
+        assert_eq!(kf.project_dir, canon);
+        assert_eq!(
+            kf.procs[0].cwd.as_deref(),
+            Some(canon.join("frontend").as_path())
+        );
+        // Errors keep the path as the user gave it.
+        assert_eq!(kf.path, file);
+    }
+
+    #[test]
+    fn load_reports_an_unreadable_file_as_a_config_error() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("nope").join(FILE_NAME);
+        let errs = messages(load(&missing).unwrap_err());
+        assert_eq!(errs.len(), 1);
+        assert!(
+            errs[0].starts_with(&format!("{}: cannot read", missing.display())),
+            "{}",
+            errs[0]
+        );
     }
 }
