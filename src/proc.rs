@@ -25,7 +25,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, setpgid};
 
 use crate::config::ProcSpec;
-use crate::types::{Config, Event, ExitStatus, Gen, ProcId, Seq, StreamTag};
+use crate::types::{Config, Event, ExitStatus, Gen, ProcId, Seq, StreamTag, Trigger};
 
 /// One spawn of a slot's command. A slot holds at most one generation that may
 /// still be alive; a restart tears it down and replaces it.
@@ -82,6 +82,8 @@ struct Restart {
     machine: ShutdownMachine,
     /// Command to spawn once the old generation is gone.
     next: String,
+    /// What asked for the restart; reported in the [`Transition`].
+    trigger: Trigger,
 }
 
 /// How a generation ended.
@@ -121,6 +123,8 @@ pub struct Transition {
     /// `None` when the slot had no generation to end (it never started).
     pub old: Option<OldGen>,
     pub new: NewGen,
+    /// What asked for the transition.
+    pub trigger: Trigger,
 }
 
 /// Manages the full set of child processes and the shared event channel.
@@ -267,7 +271,7 @@ impl ProcManager {
     /// spawn `command` in its place. Non-blocking: the teardown is driven by
     /// [`tick`](Self::tick). Returns `false`, doing nothing, if a restart is
     /// already in flight.
-    pub fn replace(&mut self, proc: ProcId, command: String) -> bool {
+    pub fn replace(&mut self, proc: ProcId, command: String, trigger: Trigger) -> bool {
         let slot = &mut self.procs[proc];
         if slot.restart.is_some() {
             return false;
@@ -289,6 +293,7 @@ impl ProcManager {
         slot.restart = Some(Restart {
             machine: ShutdownMachine::new(to_kill, self.grace_period),
             next: command,
+            trigger,
         });
         true
     }
@@ -298,9 +303,9 @@ impl ProcManager {
     /// so this equals [`replace`](Self::replace) with the current command; it
     /// diverges once an override can run in a slot. Returns `false`, doing
     /// nothing, if a restart is already in flight.
-    pub fn kill(&mut self, proc: ProcId) -> bool {
+    pub fn kill(&mut self, proc: ProcId, trigger: Trigger) -> bool {
         let standard = self.procs[proc].spec.command.clone();
-        self.replace(proc, standard)
+        self.replace(proc, standard, trigger)
     }
 
     /// Step every in-flight restart by one poll; spawn the next generation of
@@ -324,7 +329,12 @@ impl ProcManager {
 
     /// Retire the slot's old generation and spawn the next one.
     fn complete(&mut self, proc: ProcId, restart: Restart) -> Transition {
-        let abandoned = !restart.machine.abandoned().is_empty();
+        let Restart {
+            machine,
+            next,
+            trigger,
+        } = restart;
+        let abandoned = !machine.abandoned().is_empty();
         let old = self.procs[proc].live.take().map(|mut g| {
             let ran = g.started.elapsed();
             // Join only a waiter that has already published `dead`; an
@@ -347,7 +357,7 @@ impl ProcManager {
                 ran,
             }
         });
-        let command = restart.next;
+        let command = next;
         let r#gen = self.procs[proc].r#gen + 1;
         self.procs[proc].r#gen = r#gen;
         let spec = &self.procs[proc].spec;
@@ -379,7 +389,12 @@ impl ProcManager {
             command,
             spawn,
         };
-        Transition { proc, old, new }
+        Transition {
+            proc,
+            old,
+            new,
+            trigger,
+        }
     }
 
     /// Number of the slot's current generation.
@@ -405,6 +420,13 @@ impl ProcManager {
     pub fn current_command(&self, proc: ProcId) -> &str {
         let p = &self.procs[proc];
         p.live.as_ref().map_or(&p.spec.command, |g| &g.command)
+    }
+
+    /// The slot's configured command, regardless of what its current
+    /// generation runs.
+    #[allow(dead_code)] // wired in by a later task
+    pub fn standard_command(&self, proc: ProcId) -> &str {
+        &self.procs[proc].spec.command
     }
 
     /// Hand out the next global sequence number, for lines krawatte inserts
@@ -1131,7 +1153,7 @@ mod tests {
         );
 
         // A restarted generation runs in the same directory and environment.
-        assert!(mgr.replace(0, spec.command.clone()));
+        assert!(mgr.replace(0, spec.command.clone(), Trigger::Key('r')));
         tick_until_transition(&mut mgr, Duration::from_secs(5));
         wait_until_dead(&mgr);
         assert_eq!(
@@ -1177,10 +1199,10 @@ mod tests {
         let mut mgr = ProcManager::spawn_all(std::slice::from_ref(&cmd), &short_grace(), tx);
         let old_pid = read_pid_line(&rx);
 
-        assert!(mgr.replace(0, cmd.clone()));
+        assert!(mgr.replace(0, cmd.clone(), Trigger::Key('r')));
         assert!(mgr.is_restarting(0));
         // A second request while one is in flight is ignored.
-        assert!(!mgr.replace(0, cmd.clone()));
+        assert!(!mgr.replace(0, cmd.clone(), Trigger::Key('r')));
 
         let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
         assert_eq!(t.proc, 0);
@@ -1194,6 +1216,7 @@ mod tests {
         assert_eq!(t.new.command, cmd);
         let new_pid = t.new.spawn.expect("respawn succeeded");
         assert_ne!(new_pid, old_pid.as_raw());
+        assert_eq!(t.trigger, Trigger::Key('r'));
 
         assert!(group_gone(old_pid));
         assert!(!mgr.is_restarting(0));
@@ -1215,7 +1238,7 @@ mod tests {
         wait_until_dead(&mgr);
 
         let started = Instant::now();
-        assert!(mgr.replace(0, "exit 4".to_string()));
+        assert!(mgr.replace(0, "exit 4".to_string(), Trigger::Key('r')));
         let t = tick_until_transition(&mut mgr, Duration::from_secs(2));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(t.old.unwrap().outcome, Outcome::Exited(ExitStatus::Code(3)));
@@ -1234,7 +1257,7 @@ mod tests {
             tx,
             "/nonexistent/krawatte-no-such-shell",
         );
-        assert!(mgr.replace(0, "whatever".to_string()));
+        assert!(mgr.replace(0, "whatever".to_string(), Trigger::Key('r')));
         let t = tick_until_transition(&mut mgr, Duration::from_secs(2));
         assert!(t.old.is_none());
         assert_eq!(t.new.r#gen, 1);
@@ -1253,7 +1276,7 @@ mod tests {
         let bg = read_pid_line(&rx);
         assert!(nix::sys::signal::kill(bg, None).is_ok());
 
-        assert!(mgr.replace(0, "true".to_string()));
+        assert!(mgr.replace(0, "true".to_string(), Trigger::Key('r')));
         tick_until_transition(&mut mgr, Duration::from_secs(5));
 
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1274,7 +1297,7 @@ mod tests {
         let mut mgr = ProcManager::spawn_all(std::slice::from_ref(&cmd), &short_grace(), tx);
         // Give `sh` a moment to install the trap before TERM arrives.
         std::thread::sleep(Duration::from_millis(100));
-        assert!(mgr.replace(0, cmd));
+        assert!(mgr.replace(0, cmd, Trigger::Key('r')));
         // One step: TERM has been sent, the grace clock is running.
         assert!(mgr.tick().is_empty());
         assert!(mgr.is_restarting(0));
@@ -1346,17 +1369,31 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let mut mgr = ProcManager::spawn_all(&["sleep 30".to_string()], &short_grace(), tx);
         // Run something else in the slot, as a future override would.
-        assert!(mgr.replace(0, "sleep 31".to_string()));
+        assert!(mgr.replace(0, "sleep 31".to_string(), Trigger::Key('r')));
         tick_until_transition(&mut mgr, Duration::from_secs(5));
         assert_eq!(mgr.current_command(0), "sleep 31");
 
-        assert!(mgr.kill(0));
-        assert!(!mgr.kill(0), "kill while in flight is ignored");
+        assert!(mgr.kill(0, Trigger::Key('k')));
+        assert!(
+            !mgr.kill(0, Trigger::Key('k')),
+            "kill while in flight is ignored"
+        );
         let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
         assert_eq!(t.old.unwrap().r#gen, 1);
         assert_eq!(t.new.r#gen, 2);
         assert_eq!(t.new.command, "sleep 30");
         assert_eq!(mgr.current_command(0), "sleep 30");
+        shutdown_within(mgr, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn standard_command_is_the_configured_one_even_while_running_something_else() {
+        let (tx, _rx) = mpsc::channel();
+        let mut mgr = ProcManager::spawn_all(&["sleep 30".to_string()], &short_grace(), tx);
+        assert!(mgr.replace(0, "sleep 31".to_string(), Trigger::Key('r')));
+        tick_until_transition(&mut mgr, Duration::from_secs(5));
+        assert_eq!(mgr.current_command(0), "sleep 31");
+        assert_eq!(mgr.standard_command(0), "sleep 30");
         shutdown_within(mgr, Duration::from_secs(5));
     }
 }

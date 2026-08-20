@@ -6,6 +6,7 @@
 //! dependencies on `buffer`, `proc`, or `ui`, so it can be built and reasoned
 //! about in isolation.
 
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 /// Stable index identifying a single child process, `0..N` in CLI argument order.
@@ -103,4 +104,16 @@ impl Default for Config {
             buffer_cap: 10_000,
         }
     }
+}
+
+/// Why a slot transition happened. Recorded in the marker block so the buffer
+/// says not just *that* a generation was replaced but what asked for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Trigger {
+    /// A hotkey in the TUI (`r` or `k`).
+    Key(char),
+    /// A watched path changed. `paths` are project-relative and capped for
+    /// display; `more` counts the ones not listed.
+    #[allow(dead_code)] // constructed by the watcher, wired in by a later task
+    Watch { paths: Vec<PathBuf>, more: usize },
 }

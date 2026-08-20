@@ -7,19 +7,32 @@
 use std::time::Duration;
 
 use crate::proc::{Outcome, Transition};
-use crate::types::ExitStatus;
+use crate::types::{ExitStatus, Trigger};
 
 /// The lines describing a completed transition, in buffer order. `clock` is
 /// the already-formatted local time of the transition (`HH:MM:SS`);
 /// formatting time is the UI's job, since only it knows the timezone.
 pub fn restart_block(t: &Transition, clock: &str) -> Vec<String> {
-    let mut lines = Vec::with_capacity(4);
+    let mut lines = Vec::with_capacity(5);
 
     let header = match &t.old {
         Some(o) => format!("restart · gen {} → {}", o.r#gen, t.new.r#gen),
         None => format!("start · gen {}", t.new.r#gen),
     };
-    lines.push(rule(&format!("{header} · {clock}")));
+    lines.push(rule(&format!(
+        "{header} · {clock} · {}",
+        trigger_label(&t.trigger)
+    )));
+
+    if let Trigger::Watch { paths, more } = &t.trigger {
+        let listed: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        let suffix = if *more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        lines.push(rule(&format!("changed: {}{suffix}", listed.join(", "))));
+    }
 
     match &t.old {
         Some(o) => {
@@ -55,6 +68,14 @@ fn rule(text: &str) -> String {
     format!("── {text} ──")
 }
 
+/// Short trigger text for the header: `key r`, `key k`, `watch`.
+fn trigger_label(trigger: &Trigger) -> String {
+    match trigger {
+        Trigger::Key(c) => format!("key {c}"),
+        Trigger::Watch { .. } => "watch".to_string(),
+    }
+}
+
 /// Whole-second runtime in its two largest units: `12s`, `4m12s`, `2h02m`.
 fn fmt_duration(d: Duration) -> String {
     let secs = d.as_secs();
@@ -72,6 +93,8 @@ fn fmt_duration(d: Duration) -> String {
 mod tests {
     use super::*;
     use crate::proc::{NewGen, OldGen};
+    use crate::types::Trigger;
+    use std::path::PathBuf;
 
     fn old(r#gen: u32, outcome: Outcome, ran_secs: u64) -> OldGen {
         OldGen {
@@ -96,15 +119,51 @@ mod tests {
             proc: 0,
             old: Some(old(2, Outcome::Exited(ExitStatus::Signal(15)), 252)),
             new: new(3, Ok(48213)),
+            trigger: Trigger::Key('r'),
         };
         assert_eq!(
             restart_block(&t, "14:02:11"),
             vec![
-                "── restart · gen 2 → 3 · 14:02:11 ──",
+                "── restart · gen 2 → 3 · 14:02:11 · key r ──",
                 "── gen 2: pid 47105 · killed by signal 15 · ran 4m12s ──",
                 "── gen 3: pid 48213 ──",
                 "── cmd: target/debug/erhebimus ──",
             ]
+        );
+    }
+
+    #[test]
+    fn watch_trigger_adds_a_changed_line_with_overflow_count() {
+        let t = Transition {
+            proc: 0,
+            old: Some(old(2, Outcome::Exited(ExitStatus::Signal(15)), 252)),
+            new: new(3, Ok(48213)),
+            trigger: Trigger::Watch {
+                paths: vec![
+                    PathBuf::from("platform/server/src/main.rs"),
+                    PathBuf::from("platform/server/src/lib.rs"),
+                ],
+                more: 2,
+            },
+        };
+        let lines = restart_block(&t, "14:02:11");
+        assert_eq!(lines[0], "── restart · gen 2 → 3 · 14:02:11 · watch ──");
+        assert_eq!(
+            lines[1],
+            "── changed: platform/server/src/main.rs, platform/server/src/lib.rs (+2 more) ──"
+        );
+        assert_eq!(lines.len(), 5);
+
+        let one = Transition {
+            trigger: Trigger::Watch {
+                paths: vec![PathBuf::from("target/debug/erhebimus")],
+                more: 0,
+            },
+            ..t
+        };
+        assert_eq!(
+            restart_block(&one, "x")[1],
+            "── changed: target/debug/erhebimus ──"
         );
     }
 
@@ -114,6 +173,7 @@ mod tests {
             proc: 0,
             old: Some(old(0, Outcome::Exited(ExitStatus::Code(101)), 3)),
             new: new(1, Ok(1)),
+            trigger: Trigger::Key('r'),
         };
         assert_eq!(
             restart_block(&exit, "x")[1],
@@ -123,6 +183,7 @@ mod tests {
             proc: 0,
             old: Some(old(0, Outcome::Abandoned, 7322)),
             new: new(1, Ok(1)),
+            trigger: Trigger::Key('r'),
         };
         assert_eq!(
             restart_block(&abandoned, "x")[1],
@@ -132,9 +193,10 @@ mod tests {
             proc: 0,
             old: None,
             new: new(1, Ok(1)),
+            trigger: Trigger::Key('r'),
         };
         let lines = restart_block(&never, "x");
-        assert_eq!(lines[0], "── start · gen 1 · x ──");
+        assert_eq!(lines[0], "── start · gen 1 · x · key r ──");
         assert_eq!(lines[1], "── gen 0: never started ──");
     }
 
@@ -144,6 +206,7 @@ mod tests {
             proc: 0,
             old: Some(old(0, Outcome::Exited(ExitStatus::Code(0)), 1)),
             new: new(1, Err("No such file or directory".to_string())),
+            trigger: Trigger::Key('r'),
         };
         assert_eq!(
             restart_block(&failed, "x")[2],

@@ -29,7 +29,7 @@ use ratatui::backend::CrosstermBackend;
 use crate::buffer::{BufferSet, StyledLine};
 use crate::config::ProcSpec;
 use crate::proc::{ProcManager, Transition};
-use crate::types::{Config, Event, ExitStatus, Health};
+use crate::types::{Config, Event, ExitStatus, Health, Trigger};
 use crate::ui::{Action, UiState};
 
 /// RAII guard that restores the terminal to a sane state (leave alternate
@@ -202,12 +202,12 @@ fn event_loop(
                 Action::Quit => return Ok(()),
                 Action::Restart(p) => {
                     let command = manager.current_command(p).to_string();
-                    if manager.replace(p, command) {
+                    if manager.replace(p, command, Trigger::Key('r')) {
                         ui.set_health(p, Health::Restarting);
                     }
                 }
                 Action::Kill(p) => {
-                    if manager.kill(p) {
+                    if manager.kill(p, Trigger::Key('k')) {
                         ui.set_health(p, Health::Restarting);
                     }
                 }
@@ -322,7 +322,7 @@ fn status_label(started: bool, status: Option<ExitStatus>) -> String {
 mod tests {
     use super::*;
     use crate::config::{FILE_NAME, Watch};
-    use crate::types::{Gen, StreamTag};
+    use crate::types::{Gen, StreamTag, Trigger};
     use std::fs;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -420,7 +420,7 @@ mod tests {
         let mut buffers = BufferSet::new(1, &config);
         let mut ui = UiState::new(vec!["sleep".to_string()]);
 
-        assert!(manager.replace(0, "sleep 30".to_string()));
+        assert!(manager.replace(0, "sleep 30".to_string(), Trigger::Key('r')));
         ui.set_health(0, Health::Restarting);
 
         // Mid-teardown: output from the dying generation is still shown, but
