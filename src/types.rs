@@ -46,6 +46,7 @@ pub enum Health {
     /// Process is alive and running.
     Running,
     /// The current generation is being torn down ahead of a respawn.
+    // TODO(Task 7): drop the allow once main.rs sets this on restart.
     #[allow(dead_code)]
     Restarting,
     /// Process exited cleanly (`exit 0`).

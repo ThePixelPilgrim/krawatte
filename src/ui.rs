@@ -68,6 +68,11 @@ pub enum Action {
     Continue,
     /// User requested quit (`q` or Ctrl-C); begin shutdown.
     Quit,
+    /// `r` in a single pane: restart that slot's current generation.
+    Restart(ProcId),
+    /// `k` in a single pane: kill that slot's current generation and apply its
+    /// on-exit policy.
+    Kill(ProcId),
 }
 
 /// Palette used to give each process a stable, distinct tag color. Indexed by
@@ -113,6 +118,10 @@ pub enum KeyCommand {
     CycleTimeDisplay,
     /// `w`: toggle wrapping of over-wide lines onto continuation rows.
     ToggleWrap,
+    /// `r`: restart the viewed slot.
+    Restart,
+    /// `k`: kill the viewed slot's current generation.
+    Kill,
     /// No mapped action.
     None,
 }
@@ -129,6 +138,8 @@ pub fn map_key(key: KeyEvent) -> KeyCommand {
         KeyCode::Char('a') => KeyCommand::AllView,
         KeyCode::Char('d') => KeyCommand::CycleTimeDisplay,
         KeyCode::Char('w') => KeyCommand::ToggleWrap,
+        KeyCode::Char('r') => KeyCommand::Restart,
+        KeyCode::Char('k') => KeyCommand::Kill,
         KeyCode::Char('0') => KeyCommand::AllView,
         KeyCode::Char(c @ '1'..='9') => {
             // '1' -> pane 0
@@ -289,6 +300,13 @@ impl UiState {
         }
     }
 
+    /// Current health of a slot, as shown in the status bar.
+    // TODO(Task 7): drop the allow once main.rs uses this.
+    #[allow(dead_code)]
+    pub fn health(&self, proc: ProcId) -> Health {
+        self.health.get(proc).copied().unwrap_or(Health::Running)
+    }
+
     /// Maximum scroll offset for a content of `content_len` lines within the
     /// current viewport.
     fn max_offset(&self) -> usize {
@@ -338,6 +356,18 @@ impl UiState {
                     self.pending_anchor = self.bottom_logical_line();
                 }
                 self.wrap = !self.wrap;
+            }
+            // In the all-view there is no slot to act on, so the keys do
+            // nothing at all: no view change, no message.
+            KeyCommand::Restart => {
+                if let View::Single(p) = self.view {
+                    return Action::Restart(p);
+                }
+            }
+            KeyCommand::Kill => {
+                if let View::Single(p) = self.view {
+                    return Action::Kill(p);
+                }
             }
             KeyCommand::None => {}
         }
@@ -869,6 +899,36 @@ mod tests {
     }
 
     #[test]
+    fn map_key_restart_and_kill() {
+        assert_eq!(map_key(key(KeyCode::Char('r'))), KeyCommand::Restart);
+        assert_eq!(map_key(key(KeyCode::Char('k'))), KeyCommand::Kill);
+    }
+
+    #[test]
+    fn restart_and_kill_act_only_in_a_single_pane() {
+        let mut s = ui(3);
+        // All-view: silent no-op, view unchanged.
+        assert_eq!(s.handle_key(key(KeyCode::Char('r'))), Action::Continue);
+        assert_eq!(s.handle_key(key(KeyCode::Char('k'))), Action::Continue);
+        assert_eq!(s.view(), View::All);
+
+        s.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(s.handle_key(key(KeyCode::Char('r'))), Action::Restart(1));
+        assert_eq!(s.handle_key(key(KeyCode::Char('k'))), Action::Kill(1));
+        // The key neither changes the view nor touches the scroll position.
+        assert_eq!(s.view(), View::Single(1));
+        assert!(s.following());
+    }
+
+    #[test]
+    fn health_accessor_reflects_set_health() {
+        let mut s = ui(2);
+        assert_eq!(s.health(1), Health::Running);
+        s.set_health(1, Health::Restarting);
+        assert_eq!(s.health(1), Health::Restarting);
+    }
+
+    #[test]
     fn handle_key_jump_out_of_range_ignored() {
         let mut s = ui(2);
         // pane 5 (key '5') does not exist -> stays in All
@@ -1065,6 +1125,7 @@ mod tests {
     #[test]
     fn health_glyph_variants() {
         assert!(health_glyph(Health::Running).0.contains('●'));
+        assert_eq!(health_glyph(Health::Restarting).0, "↻");
         assert_eq!(health_glyph(Health::ExitedOk).0, "✔ exit 0");
         assert_eq!(
             health_glyph(Health::ExitedErr(ExitStatus::Code(2))).0,
