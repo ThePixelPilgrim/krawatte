@@ -39,9 +39,9 @@ Each array entry is one of:
 | a directory | watched recursively |
 | a file | its parent directory is watched, events filtered to that file name — so a tool that writes a temp file and renames it into place (cargo, most editors) is still seen, and the file is always complete when it is |
 
-Relative entries and the `self` token resolve against the slot's effective
-cwd (`cwd` if set, else the project dir) — the same base the command itself
-uses for relative paths.
+Relative entries and the `self` token resolve against the slot's working
+directory (`cwd` if set, else the project dir — spec B) — the same base the
+command itself uses for relative paths.
 
 Load-time validation (reported with the other config errors, exit 2):
 

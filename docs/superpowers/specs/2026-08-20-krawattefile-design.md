@@ -67,7 +67,7 @@ cwd   = "frontend"
 | `settings.timeout` | no | grace period in seconds, default `5`; an explicit `-t` on the CLI wins |
 | `proc.name` | yes | unique; `[A-Za-z0-9_-]+`; not all digits (indices address slots in spec C); not `all` |
 | `proc.cmd` | yes | run via `sh -c`, as today |
-| `proc.cwd` | no | working directory, relative to the project dir (absolute allowed); must exist at load |
+| `proc.cwd` | no | working directory, relative to the project dir (absolute allowed); must exist at load. **Default: the project dir itself** — never the directory krawatte was launched from, which with walk-up discovery may be any subdirectory |
 | `proc.env` | no | table of string → string, set on top of the inherited environment |
 | `proc.watch` | no | the bare string `"self"`, or an array of path strings (a path literally named `self` goes in the array); any other bare string is an error; interpreted in spec D |
 | `proc.ignore` | no | array of glob strings; stored here, interpreted in spec D |
@@ -94,9 +94,13 @@ Exit 2, terminal untouched.
 - Every generation of a slot — initial, `r`, `k`, later watch and override —
   spawns with the slot's `cwd` and `env`. An override command (spec C) runs
   in the same directory and environment as the standard command.
-- Paths inside `cmd` are the command's business: `sh -c` runs in `cwd`, so a
-  relative path in `cmd` is relative to `cwd` (or the project dir if `cwd` is
-  unset). krawatte itself does not `chdir`.
+- Every slot has a working directory: `cwd` if set, else the project dir.
+  `sh -c` runs there, so a relative path in `cmd` is relative to it. A
+  Krawattefile therefore behaves the same whether `krawatte` is started in
+  the project dir or three levels below it. krawatte's own process does not
+  `chdir`; only children do.
+- Ad-hoc slots (positional commands) keep inheriting krawatte's cwd, as
+  today.
 
 ## Design
 
@@ -108,7 +112,9 @@ Pure parsing and validation, no I/O beyond what the caller hands in:
 pub struct ProcSpec {
     pub name: String,
     pub command: String,
-    /// Absolute, already resolved against the project dir. `None` = inherit.
+    /// Absolute, already resolved against the project dir; the project dir
+    /// itself when the file sets no `cwd`. `None` only for ad-hoc slots,
+    /// which inherit krawatte's cwd.
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     /// As written: the `self` keyword, or path entries. Spec D resolves them.
@@ -160,7 +166,9 @@ is not worth it.
 
 ## Testing
 
-- `config::parse` against inline strings: the example above; missing `name`;
+- `config::parse` against inline strings: the example above (a proc without
+  `cwd` resolves to the project dir; `cwd = "frontend"` resolves under it);
+  missing `name`;
   missing `cmd`; duplicate name; invalid name (`"my proc"`, `"12"`, `"all"`);
   unknown key at top level and inside a proc; `watch = "self"`, `watch = ["self", "src"]`,
   and bare `watch = "src"` rejected;
@@ -171,6 +179,8 @@ is not worth it.
 - Spawn with `cwd` and `env`: a spec running `pwd; echo $KRAWATTE_TEST` in a
   tempdir produces both expected lines; after `replace`, the new generation
   prints the same (cwd/env survive restart).
+- Launch from a subdirectory: `discover` from `project/a/b` finds the file
+  and a proc without `cwd` prints `project` for `pwd`, not `project/a/b`.
 - `main`: CLI argument combinations (`-f` + positional rejected) via clap's
   `try_parse_from`.
 
@@ -186,8 +196,8 @@ Interpreting `watch`/`ignore` (D), any socket or subcommand (C), per-slot
   will need a modeline for highlighting; the upside is that it reads as a
   project marker like `Makefile`/`justfile`.
 - Discovery walks up the directory tree rather than checking only cwd.
-- Relative `cwd` resolves against the project dir; relative paths in `cmd`
-  resolve against the effective cwd, because that is what the shell does.
+- A slot's working directory defaults to the project dir, not to where
+  krawatte was launched; relative `cwd` resolves against the project dir.
 - Unknown keys are hard errors.
 - `-f` with positional commands is an error rather than "positional wins".
 - The ad-hoc form stays positional; an ad-hoc command named like a future
