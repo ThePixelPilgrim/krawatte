@@ -30,19 +30,15 @@ use crate::types::{Config, Event, ExitStatus, Gen, ProcId, Seq, StreamTag};
 /// still be alive; a restart tears it down and replaces it.
 struct Generation {
     /// Which generation of its slot this is; `0` for the initial spawn.
-    #[allow(dead_code)]
     r#gen: Gen,
     /// The command this generation runs (as passed to `sh -c`).
-    #[allow(dead_code)]
     command: String,
     /// Pid of the `sh` that leads this generation's process group.
-    #[allow(dead_code)]
     pid: i32,
     /// Process-group id used for signalling (equal to `pid`, since the child
     /// leads its own group).
     pgid: Pid,
     /// When the generation was spawned, for the runtime reported on restart.
-    #[allow(dead_code)]
     started: Instant,
     /// Set to `true` by the waiter thread once the child has been reaped.
     dead: Arc<AtomicBool>,
@@ -67,16 +63,70 @@ struct Generation {
 /// Per-slot state: the configured command and the current generation.
 struct Proc {
     /// The slot's configured command (the CLI argument).
-    #[allow(dead_code)]
     standard: String,
     /// Precomputed short display name for the status bar.
     short: String,
     /// Number of the most recent generation; `0` for the initial spawn.
-    #[allow(dead_code)]
     r#gen: Gen,
     /// The most recent generation, or `None` if the slot has never spawned
     /// successfully.
     live: Option<Generation>,
+    /// Teardown in progress, if any. A slot has at most one.
+    restart: Option<Restart>,
+}
+
+/// An in-flight restart: the teardown of the current generation, and what to
+/// run once it is gone.
+#[allow(dead_code)] // wired into main.rs by a later task
+struct Restart {
+    /// Single-slot TERM -> grace -> KILL machine; starts `Done` if there was
+    /// nothing to tear down.
+    machine: ShutdownMachine,
+    /// Command to spawn once the old generation is gone.
+    next: String,
+}
+
+/// How a generation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // wired into main.rs by a later task
+pub enum Outcome {
+    /// Reaped with this status.
+    Exited(ExitStatus),
+    /// Still present after SIGKILL and the reap timeout; given up on so the
+    /// restart could finish.
+    Abandoned,
+}
+
+/// The generation a [`Transition`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // wired into main.rs by a later task
+pub struct OldGen {
+    pub r#gen: Gen,
+    pub pid: i32,
+    pub outcome: Outcome,
+    /// How long the generation ran, spawn to teardown.
+    pub ran: Duration,
+}
+
+/// The generation a [`Transition`] started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // wired into main.rs by a later task
+pub struct NewGen {
+    pub r#gen: Gen,
+    pub command: String,
+    /// The new leader's pid, or why it could not be spawned.
+    pub spawn: Result<i32, String>,
+}
+
+/// A completed slot transition, reported by [`ProcManager::tick`] so the
+/// caller can record it in the slot's buffer and update the health display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // wired into main.rs by a later task
+pub struct Transition {
+    pub proc: ProcId,
+    /// `None` when the slot had no generation to end (it never started).
+    pub old: Option<OldGen>,
+    pub new: NewGen,
 }
 
 /// Manages the full set of child processes and the shared event channel.
@@ -133,6 +183,7 @@ impl ProcManager {
                 short: short_name_of(command),
                 r#gen: 0,
                 live,
+                restart: None,
             });
         }
         mgr
@@ -162,6 +213,9 @@ impl ProcManager {
         // group leader does not dissolve its group: background jobs started with
         // `&` live on in it, still holding the child's pipes. Selecting on
         // `!dead` here used to skip those groups entirely, leaving them running.
+        for p in &mut self.procs {
+            p.restart = None;
+        }
         let live: Vec<ProcId> = self
             .procs
             .iter()
@@ -202,6 +256,144 @@ impl ProcManager {
     /// bar).
     pub fn short_name(&self, proc: ProcId) -> &str {
         &self.procs[proc].short
+    }
+
+    /// Tear down the slot's current generation (if any is still around), then
+    /// spawn `command` in its place. Non-blocking: the teardown is driven by
+    /// [`tick`](Self::tick). Returns `false`, doing nothing, if a restart is
+    /// already in flight.
+    #[allow(dead_code)] // wired into main.rs by a later task
+    pub fn replace(&mut self, proc: ProcId, command: String) -> bool {
+        let slot = &mut self.procs[proc];
+        if slot.restart.is_some() {
+            return false;
+        }
+        // A generation that already exited and whose group is empty needs no
+        // teardown. Mark it finished now so nothing signals its pgid -- which
+        // the kernel may by now have handed to an unrelated process.
+        if let Some(g) = slot.live.as_mut()
+            && !g.finished
+            && g.dead.load(Ordering::SeqCst)
+            && group_gone(g.pgid)
+        {
+            g.finished = true;
+        }
+        let to_kill = match &slot.live {
+            Some(g) if !g.finished => vec![proc],
+            _ => Vec::new(),
+        };
+        slot.restart = Some(Restart {
+            machine: ShutdownMachine::new(to_kill, self.grace_period),
+            next: command,
+        });
+        true
+    }
+
+    /// Step every in-flight restart by one poll; spawn the next generation of
+    /// each slot whose teardown completed. Returns the completed transitions in
+    /// slot order. Call this from the main loop; it never blocks.
+    #[allow(dead_code)] // wired into main.rs by a later task
+    pub fn tick(&mut self) -> Vec<Transition> {
+        let mut out = Vec::new();
+        for proc in 0..self.procs.len() {
+            let Some(mut restart) = self.procs[proc].restart.take() else {
+                continue;
+            };
+            restart.machine.step(&mut RealEffects { mgr: self });
+            if restart.machine.phase() != ShutdownPhase::Done {
+                self.procs[proc].restart = Some(restart);
+                continue;
+            }
+            out.push(self.complete(proc, restart));
+        }
+        out
+    }
+
+    /// Retire the slot's old generation and spawn the next one.
+    fn complete(&mut self, proc: ProcId, restart: Restart) -> Transition {
+        let abandoned = !restart.machine.abandoned().is_empty();
+        let old = self.procs[proc].live.take().map(|mut g| {
+            let ran = g.started.elapsed();
+            // Join only a waiter that has already published `dead`; an
+            // abandoned generation's waiter is still blocked in `wait()`.
+            if g.dead.load(Ordering::SeqCst)
+                && let Some(h) = g.waiter.take()
+            {
+                let _ = h.join();
+            }
+            let outcome = if abandoned {
+                Outcome::Abandoned
+            } else {
+                let status = *g.status.lock().unwrap();
+                Outcome::Exited(status.unwrap_or(ExitStatus::Code(-1)))
+            };
+            OldGen {
+                r#gen: g.r#gen,
+                pid: g.pid,
+                outcome,
+                ran,
+            }
+        });
+        let command = restart.next;
+        let r#gen = self.procs[proc].r#gen + 1;
+        self.procs[proc].r#gen = r#gen;
+        let spawn = match spawn_one(proc, r#gen, &self.shell, &command, &self.seq, &self.tx) {
+            Ok(g) => {
+                let pid = g.pid;
+                self.procs[proc].live = Some(g);
+                Ok(pid)
+            }
+            Err(e) => {
+                let _ = self.tx.send(Event::SpawnFailed {
+                    proc,
+                    r#gen,
+                    error: e.to_string(),
+                });
+                Err(e.to_string())
+            }
+        };
+        let new = NewGen {
+            r#gen,
+            command,
+            spawn,
+        };
+        Transition { proc, old, new }
+    }
+
+    /// Number of the slot's current generation.
+    #[allow(dead_code)] // wired into main.rs by a later task
+    pub fn current_gen(&self, proc: ProcId) -> Gen {
+        self.procs[proc].r#gen
+    }
+
+    /// Whether an event stamped `gen` belongs to the slot's current generation.
+    /// Anything older is stale output from a replaced generation (or from a
+    /// grandchild that escaped its group and still holds the old pipe).
+    #[allow(dead_code)] // wired into main.rs by a later task
+    pub fn is_current(&self, proc: ProcId, r#gen: Gen) -> bool {
+        self.procs.get(proc).is_some_and(|p| p.r#gen == r#gen)
+    }
+
+    /// Whether a teardown is in flight for this slot.
+    #[allow(dead_code)] // wired into main.rs by a later task
+    pub fn is_restarting(&self, proc: ProcId) -> bool {
+        self.procs.get(proc).is_some_and(|p| p.restart.is_some())
+    }
+
+    /// The command the slot's current generation runs; the standard command if
+    /// the slot has never spawned.
+    #[allow(dead_code)] // wired into main.rs by a later task
+    pub fn current_command(&self, proc: ProcId) -> &str {
+        let p = &self.procs[proc];
+        p.live.as_ref().map_or(&p.standard, |g| &g.command)
+    }
+
+    /// Hand out the next global sequence number, for lines krawatte inserts
+    /// into a buffer itself. Shares the counter the reader threads use, so the
+    /// line sorts after everything that arrived before it.
+    #[allow(dead_code)] // wired into main.rs by a later task
+    pub fn next_seq(&self) -> Seq {
+        self.seq.fetch_add(1, Ordering::SeqCst)
     }
 }
 
@@ -476,7 +668,6 @@ impl ShutdownMachine {
 
     /// Processes shutdown gave up on: still alive after SIGKILL and the reap
     /// timeout. Empty on every normal shutdown.
-    #[allow(dead_code)]
     pub fn abandoned(&self) -> Vec<ProcId> {
         let mut a = self.abandoned.clone();
         a.sort();
@@ -484,7 +675,6 @@ impl ShutdownMachine {
     }
 
     /// Current phase.
-    #[allow(dead_code)]
     pub fn phase(&self) -> ShutdownPhase {
         self.phase
     }
@@ -897,6 +1087,154 @@ mod tests {
             }
         }
         panic!("child never reported a background pid");
+    }
+
+    /// Drive `tick` until some slot reports a transition (bounded).
+    fn tick_until_transition(mgr: &mut ProcManager, limit: Duration) -> Transition {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if let Some(t) = mgr.tick().pop() {
+                return t;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no transition within {limit:?}");
+    }
+
+    fn short_grace() -> Config {
+        Config {
+            grace_period: Duration::from_millis(200),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn restart_of_live_slot_spawns_a_new_pid_in_the_same_slot() {
+        let (tx, rx) = mpsc::channel();
+        let cmd = "echo $$; sleep 30".to_string();
+        let mut mgr = ProcManager::spawn_all(std::slice::from_ref(&cmd), &short_grace(), tx);
+        let old_pid = read_pid_line(&rx);
+
+        assert!(mgr.replace(0, cmd.clone()));
+        assert!(mgr.is_restarting(0));
+        // A second request while one is in flight is ignored.
+        assert!(!mgr.replace(0, cmd.clone()));
+
+        let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
+        assert_eq!(t.proc, 0);
+        let old = t.old.expect("slot had a live generation");
+        assert_eq!(old.r#gen, 0);
+        assert_eq!(old.pid, old_pid.as_raw());
+        // `sh` has the default TERM disposition, so the grace period never
+        // expires and the machine never escalates to KILL.
+        assert_eq!(old.outcome, Outcome::Exited(ExitStatus::Signal(15)));
+        assert_eq!(t.new.r#gen, 1);
+        assert_eq!(t.new.command, cmd);
+        let new_pid = t.new.spawn.expect("respawn succeeded");
+        assert_ne!(new_pid, old_pid.as_raw());
+
+        assert!(group_gone(old_pid));
+        assert!(!mgr.is_restarting(0));
+        assert_eq!(mgr.current_gen(0), 1);
+        assert!(mgr.is_current(0, 1));
+        assert!(!mgr.is_current(0, 0));
+        assert_eq!(mgr.current_command(0), cmd);
+        shutdown_within(mgr, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn restart_of_dead_slot_spawns_without_waiting_out_the_grace() {
+        let (tx, _rx) = mpsc::channel();
+        let cfg = Config {
+            grace_period: Duration::from_secs(30),
+            ..Config::default()
+        };
+        let mut mgr = ProcManager::spawn_all(&["exit 3".to_string()], &cfg, tx);
+        wait_until_dead(&mgr);
+
+        let started = Instant::now();
+        assert!(mgr.replace(0, "exit 4".to_string()));
+        let t = tick_until_transition(&mut mgr, Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(t.old.unwrap().outcome, Outcome::Exited(ExitStatus::Code(3)));
+        assert_eq!(t.new.command, "exit 4");
+
+        wait_until_dead(&mgr);
+        assert_eq!(mgr.shutdown(), vec![Some(ExitStatus::Code(4))]);
+    }
+
+    #[test]
+    fn restart_of_never_started_slot_reports_no_old_generation() {
+        let (tx, _rx) = mpsc::channel();
+        let mut mgr = ProcManager::spawn_all_with_shell(
+            &["whatever".to_string()],
+            &Config::default(),
+            tx,
+            "/nonexistent/krawatte-no-such-shell",
+        );
+        assert!(mgr.replace(0, "whatever".to_string()));
+        let t = tick_until_transition(&mut mgr, Duration::from_secs(2));
+        assert!(t.old.is_none());
+        assert_eq!(t.new.r#gen, 1);
+        // The shell is still missing, so the respawn fails too and says why.
+        assert!(t.new.spawn.is_err());
+        assert_eq!(mgr.current_gen(0), 1);
+        assert!(mgr.all_dead());
+    }
+
+    #[test]
+    fn restart_kills_background_jobs_left_in_the_old_group() {
+        let (tx, rx) = mpsc::channel();
+        let cmd = "sleep 30 & echo $!".to_string();
+        let mut mgr = ProcManager::spawn_all(std::slice::from_ref(&cmd), &short_grace(), tx);
+        wait_until_dead(&mgr);
+        let bg = read_pid_line(&rx);
+        assert!(nix::sys::signal::kill(bg, None).is_ok());
+
+        assert!(mgr.replace(0, "true".to_string()));
+        tick_until_transition(&mut mgr, Duration::from_secs(5));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while nix::sys::signal::kill(bg, None).is_ok() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            nix::sys::signal::kill(bg, None).is_err(),
+            "background job {bg} survived the restart"
+        );
+        shutdown_within(mgr, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn shutdown_started_mid_restart_returns_within_the_bound() {
+        let (tx, _rx) = mpsc::channel();
+        let cmd = "trap '' TERM; sleep 30".to_string();
+        let mut mgr = ProcManager::spawn_all(std::slice::from_ref(&cmd), &short_grace(), tx);
+        // Give `sh` a moment to install the trap before TERM arrives.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(mgr.replace(0, cmd));
+        // One step: TERM has been sent, the grace clock is running.
+        assert!(mgr.tick().is_empty());
+        assert!(mgr.is_restarting(0));
+        shutdown_within(mgr, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn next_seq_continues_the_global_sequence() {
+        let (tx, rx) = mpsc::channel();
+        let mut mgr =
+            ProcManager::spawn_all(&["printf 'a\\nb\\n'".to_string()], &Config::default(), tx);
+        wait_until_dead(&mgr);
+        let last = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Line { seq, .. } => Some(seq),
+                _ => None,
+            })
+            .max()
+            .unwrap();
+        assert_eq!(mgr.next_seq(), last + 1);
+        mgr.shutdown();
     }
 
     #[test]
