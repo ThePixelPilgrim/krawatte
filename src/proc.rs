@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, setpgid};
 
-use crate::config::short_name_of;
+use crate::config::ProcSpec;
 use crate::types::{Config, Event, ExitStatus, Gen, ProcId, Seq, StreamTag};
 
 /// One spawn of a slot's command. A slot holds at most one generation that may
@@ -61,12 +61,10 @@ struct Generation {
     finished: bool,
 }
 
-/// Per-slot state: the configured command and the current generation.
+/// Per-slot state: the configured slot and its current generation.
 struct Proc {
-    /// The slot's configured command (the CLI argument).
-    standard: String,
-    /// Precomputed short display name for the status bar.
-    short: String,
+    /// The slot as configured: name, standard command, cwd, env.
+    spec: ProcSpec,
     /// Number of the most recent generation; `0` for the initial spawn.
     r#gen: Gen,
     /// The most recent generation, or `None` if the slot has never spawned
@@ -138,31 +136,41 @@ pub struct ProcManager {
 }
 
 impl ProcManager {
-    /// Spawn every command (each a string run via `sh -c`), wiring reader and
-    /// waiter threads that emit [`Event`]s on `tx`. Spawn failures are reported
-    /// as [`Event::SpawnFailed`] rather than aborting the whole set.
+    /// Spawn every positional command (each a string run via `sh -c`) as an
+    /// ad-hoc slot: named by its basename, inheriting krawatte's cwd and
+    /// environment. See [`spawn_specs`](Self::spawn_specs).
     pub fn spawn_all(commands: &[String], config: &Config, tx: Sender<Event>) -> ProcManager {
-        Self::spawn_all_with_shell(commands, config, tx, "sh")
+        let specs: Vec<ProcSpec> = commands.iter().map(|c| ProcSpec::adhoc(c)).collect();
+        Self::spawn_specs(&specs, config, tx)
     }
 
-    /// Like [`spawn_all`](Self::spawn_all) but with an explicit shell program.
-    /// Exists so tests can point at a non-existent program and exercise the
-    /// genuine spawn-failure (`Event::SpawnFailed` / dead slot) code path.
+    /// Spawn every slot, wiring reader and waiter threads that emit [`Event`]s
+    /// on `tx`. Spawn failures are reported as [`Event::SpawnFailed`] rather
+    /// than aborting the whole set.
+    pub fn spawn_specs(specs: &[ProcSpec], config: &Config, tx: Sender<Event>) -> ProcManager {
+        Self::spawn_all_with_shell(specs, config, tx, "sh")
+    }
+
+    /// Like [`spawn_specs`](Self::spawn_specs) but with an explicit shell
+    /// program. Exists so tests can point at a non-existent program and
+    /// exercise the genuine spawn-failure (`Event::SpawnFailed` / dead slot)
+    /// code path.
     fn spawn_all_with_shell(
-        commands: &[String],
+        specs: &[ProcSpec],
         config: &Config,
         tx: Sender<Event>,
         shell: &str,
     ) -> ProcManager {
         let mut mgr = ProcManager {
-            procs: Vec::with_capacity(commands.len()),
+            procs: Vec::with_capacity(specs.len()),
             grace_period: config.grace_period,
             shell: shell.to_string(),
             seq: Arc::new(AtomicU64::new(0)),
             tx,
         };
-        for (proc, command) in commands.iter().enumerate() {
-            let live = match spawn_one(proc, 0, &mgr.shell, command, &mgr.seq, &mgr.tx) {
+        for (proc, spec) in specs.iter().enumerate() {
+            let live = match spawn_one(proc, 0, &mgr.shell, &spec.command, spec, &mgr.seq, &mgr.tx)
+            {
                 Ok(generation) => Some(generation),
                 Err(err) => {
                     // Spawn failure: report it and record a slot with no generation.
@@ -175,8 +183,7 @@ impl ProcManager {
                 }
             };
             mgr.procs.push(Proc {
-                standard: command.clone(),
-                short: short_name_of(command),
+                spec: spec.clone(),
                 r#gen: 0,
                 live,
                 restart: None,
@@ -248,10 +255,10 @@ impl ProcManager {
         self.procs[proc].live.is_some()
     }
 
-    /// Short display name derived from a process's command line (for the status
-    /// bar).
+    /// Display name for the status bar: the configured name, or the command's
+    /// basename for an ad-hoc slot.
     pub fn short_name(&self, proc: ProcId) -> &str {
-        &self.procs[proc].short
+        &self.procs[proc].spec.name
     }
 
     /// Tear down the slot's current generation (if any is still around), then
@@ -290,7 +297,7 @@ impl ProcManager {
     /// diverges once an override can run in a slot. Returns `false`, doing
     /// nothing, if a restart is already in flight.
     pub fn kill(&mut self, proc: ProcId) -> bool {
-        let standard = self.procs[proc].standard.clone();
+        let standard = self.procs[proc].spec.command.clone();
         self.replace(proc, standard)
     }
 
@@ -341,7 +348,16 @@ impl ProcManager {
         let command = restart.next;
         let r#gen = self.procs[proc].r#gen + 1;
         self.procs[proc].r#gen = r#gen;
-        let spawn = match spawn_one(proc, r#gen, &self.shell, &command, &self.seq, &self.tx) {
+        let spec = &self.procs[proc].spec;
+        let spawn = match spawn_one(
+            proc,
+            r#gen,
+            &self.shell,
+            &command,
+            spec,
+            &self.seq,
+            &self.tx,
+        ) {
             Ok(g) => {
                 let pid = g.pid;
                 self.procs[proc].live = Some(g);
@@ -386,7 +402,7 @@ impl ProcManager {
     /// the slot has never spawned.
     pub fn current_command(&self, proc: ProcId) -> &str {
         let p = &self.procs[proc];
-        p.live.as_ref().map_or(&p.standard, |g| &g.command)
+        p.live.as_ref().map_or(&p.spec.command, |g| &g.command)
     }
 
     /// Hand out the next global sequence number, for lines krawatte inserts
@@ -427,6 +443,7 @@ fn spawn_one(
     r#gen: Gen,
     shell: &str,
     command: &str,
+    spec: &ProcSpec,
     seq: &Arc<AtomicU64>,
     tx: &Sender<Event>,
 ) -> std::io::Result<Generation> {
@@ -436,6 +453,13 @@ fn spawn_one(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // A Krawattefile slot always has a cwd (the project dir by default); an
+    // ad-hoc slot inherits krawatte's. Env entries layer over the inherited
+    // environment rather than replacing it.
+    if let Some(dir) = &spec.cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
     // Put the child in its own process group so a later killpg reaches the
     // whole subtree, not just the immediate `sh`.
@@ -802,6 +826,7 @@ impl ShutdownEffects for RealEffects<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Watch;
     use std::sync::mpsc;
 
     /// Stub effects: a virtual clock and scripted exits, recording every signal.
@@ -971,7 +996,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let cfg = Config::default();
         let mut mgr = ProcManager::spawn_all_with_shell(
-            &["whatever".to_string()],
+            &[ProcSpec::adhoc("whatever")],
             &cfg,
             tx,
             "/nonexistent/krawatte-no-such-shell",
@@ -1069,6 +1094,61 @@ mod tests {
         panic!("child never reported a background pid");
     }
 
+    /// The text of the next `n` `Event::Line`s (skipping other events), bounded.
+    fn read_lines(rx: &mpsc::Receiver<Event>, n: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut out = Vec::new();
+        while out.len() < n && Instant::now() < deadline {
+            if let Ok(Event::Line { bytes, .. }) = rx.recv_timeout(Duration::from_millis(100)) {
+                out.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn spawn_specs_applies_cwd_and_env_and_restart_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let spec = ProcSpec {
+            name: "probe".to_string(),
+            command: "pwd; echo $KRAWATTE_TEST".to_string(),
+            cwd: Some(cwd.clone()),
+            env: vec![("KRAWATTE_TEST".to_string(), "42".to_string())],
+            watch: Watch::None,
+            ignore: Vec::new(),
+        };
+        let (tx, rx) = mpsc::channel();
+        let mut mgr = ProcManager::spawn_specs(std::slice::from_ref(&spec), &short_grace(), tx);
+        assert_eq!(mgr.short_name(0), "probe");
+        assert_eq!(mgr.current_command(0), "pwd; echo $KRAWATTE_TEST");
+        wait_until_dead(&mgr);
+        assert_eq!(
+            read_lines(&rx, 2),
+            vec![cwd.display().to_string(), "42".to_string()]
+        );
+
+        // A restarted generation runs in the same directory and environment.
+        assert!(mgr.replace(0, spec.command.clone()));
+        tick_until_transition(&mut mgr, Duration::from_secs(5));
+        wait_until_dead(&mgr);
+        assert_eq!(
+            read_lines(&rx, 2),
+            vec![cwd.display().to_string(), "42".to_string()]
+        );
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn adhoc_slots_inherit_krawattes_cwd() {
+        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut mgr = ProcManager::spawn_all(&["pwd".to_string()], &short_grace(), tx);
+        wait_until_dead(&mgr);
+        assert_eq!(read_lines(&rx, 1), vec![here.display().to_string()]);
+        mgr.shutdown();
+    }
+
     /// Drive `tick` until some slot reports a transition (bounded).
     fn tick_until_transition(mgr: &mut ProcManager, limit: Duration) -> Transition {
         let deadline = Instant::now() + limit;
@@ -1147,7 +1227,7 @@ mod tests {
     fn restart_of_never_started_slot_reports_no_old_generation() {
         let (tx, _rx) = mpsc::channel();
         let mut mgr = ProcManager::spawn_all_with_shell(
-            &["whatever".to_string()],
+            &[ProcSpec::adhoc("whatever")],
             &Config::default(),
             tx,
             "/nonexistent/krawatte-no-such-shell",
