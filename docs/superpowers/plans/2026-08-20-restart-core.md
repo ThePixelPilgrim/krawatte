@@ -1657,7 +1657,7 @@ git commit -m "Add per-slot restart with r and k hotkeys"
 **Spec coverage.**
 - `r`/`k` semantics, all-view no-op, in-flight no-op → Tasks 6 (keys) and 3/4 (`replace`/`kill` return `false`).
 - Dead / never-started slot restarts immediately → Task 3 (`begin` marks finished, machine starts `Done`; tests for both).
-- No crash-restart → nothing consults `on_exit` on self-exit; `drain_events` only sets health.
+- No crash-restart → a self-exit only reaches `drain_events`, which sets health; nothing respawns.
 - `↻` health, old exit never shows as `✖` → Task 6 glyph; Task 7 `is_restarting` filter, tested.
 - Marker block with every outcome, one topic per line → Task 5, tested for exit/signal/abandoned/never started/spawn failed.
 - Generations on events, stale drop → Tasks 1, 3, 7 (tested in `proc.rs` via `is_current` and in `main.rs` end to end).
