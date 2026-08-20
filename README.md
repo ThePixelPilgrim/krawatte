@@ -64,8 +64,45 @@ Unknown keys are errors. All problems in the file are reported together,
 with line numbers, before the terminal is touched (exit code 2). Slots
 appear in file order and the status bar shows their names.
 
-`watch` and `ignore` keys are accepted and reserved for restart-on-change;
-see `docs/superpowers/specs/2026-08-20-file-watching-design.md`.
+### Restart on change
+
+```toml
+[settings]
+debounce_ms = 100             # optional; quiet period before a change restarts a slot
+
+[[proc]]
+name  = "build"
+cmd   = "cargo build -p app"
+watch = ["src", "migrations"]  # paths, relative to the slot's working directory
+ignore = ["*.snap"]            # globs added to the built-in ignore list
+
+[[proc]]
+name  = "server"
+cmd   = "target/debug/app"
+watch = "self"                 # the file named by the command's first token
+```
+
+When a watched path changes, the slot is torn down (TERM → grace → KILL) and
+its command run again — the same thing `r` does, with `watch` as the
+trigger in the marker block and a `changed:` line naming the paths. A slot
+that is dead is simply started. Nothing is ever restarted because it
+crashed; only a change does that.
+
+- A directory is watched recursively; `.git`, `target`, `node_modules` and
+  editor temp files (`*.swp`, `*~`, `.#*`, `4913`, …) are ignored and not
+  descended into.
+- A file is watched through its directory, so a tool that writes a temp
+  file and renames it into place (cargo, most editors) is seen, and the
+  file is complete when it is. The file may not exist yet at launch.
+- `watch = "self"` is the only bare-string form; a file literally called
+  `self` goes in an array: `watch = ["self"]`. `"self"` needs a path-like
+  first token (`target/debug/app`, not `npm`).
+- The status bar shows a dim `w` after a watched slot's name.
+
+The two slots above are linked only through the filesystem: `build` reruns
+on source edits and exits with the compiler's status; `server` restarts only
+when the binary actually changes, so a failed build leaves the old server
+running.
 
 ## Behavior
 
@@ -87,8 +124,9 @@ see `docs/superpowers/specs/2026-08-20-file-watching-design.md`.
   group, waits out the grace period, SIGKILLs stragglers, then runs the same
   command again in the same slot. The UI stays live throughout; the slot shows
   `↻` while the old process is being torn down. The buffer is kept and a dim
-  marker block records the transition — generation numbers, pids, how the old
-  process ended and how long it ran, and the command. Output that arrives late
+  marker block records the transition — what triggered it (`key r`, `key k`
+  or `watch`), generation numbers, pids, how the old process ended and how
+  long it ran, and the command. Output that arrives late
   from the old process is discarded. A child that exits on its own is *not*
   restarted.
 - **Ctrl-C / `q`** sends SIGTERM to every child's process group, waits out the

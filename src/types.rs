@@ -87,7 +87,6 @@ pub enum Event {
         error: String,
     },
     /// Watched paths of a slot changed; see [`Changed`].
-    #[allow(dead_code)] // constructed by the watcher, wired in by a later task
     Changed(Changed),
 }
 
@@ -127,6 +126,5 @@ pub enum Trigger {
     Key(char),
     /// A watched path changed. `paths` are project-relative and capped for
     /// display; `more` counts the ones not listed.
-    #[allow(dead_code)] // constructed by the watcher, wired in by a later task
     Watch { paths: Vec<PathBuf>, more: usize },
 }

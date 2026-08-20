@@ -424,7 +424,6 @@ impl ProcManager {
 
     /// The slot's configured command, regardless of what its current
     /// generation runs.
-    #[allow(dead_code)] // wired in by a later task
     pub fn standard_command(&self, proc: ProcId) -> &str {
         &self.procs[proc].spec.command
     }

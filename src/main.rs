@@ -32,6 +32,7 @@ use crate::config::ProcSpec;
 use crate::proc::{ProcManager, Transition};
 use crate::types::{Config, Event, ExitStatus, Health, Trigger};
 use crate::ui::{Action, UiState};
+use crate::watch::SlotWatch;
 
 /// RAII guard that restores the terminal to a sane state (leave alternate
 /// screen, disable raw mode) on drop. Constructed after entering raw mode /
@@ -84,8 +85,8 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    let (specs, file_timeout) = match resolve_specs(&cli) {
-        Ok(resolved) => resolved,
+    let launch = match resolve_launch(&cli) {
+        Ok(launch) => launch,
         Err(messages) => {
             for m in messages {
                 eprintln!("krawatte: {m}");
@@ -94,10 +95,28 @@ fn main() {
         }
     };
     let config = Config {
-        grace_period: grace_period(cli.timeout, file_timeout),
+        grace_period: grace_period(cli.timeout, launch.timeout),
         ..Config::default()
     };
-    match run(&specs, &config) {
+    let (tx, rx) = mpsc::channel::<Event>();
+    // Watches are registered before anything is spawned or drawn, so a
+    // registration failure is a clean exit 2 and the build slot's first
+    // output is already observed.
+    if let (Some(project_dir), false) = (&launch.project_dir, launch.watches.is_empty())
+        && let Err(e) = watch::start(
+            launch.watches.clone(),
+            project_dir.clone(),
+            launch.debounce,
+            tx.clone(),
+        )
+    {
+        eprintln!("krawatte: {e}");
+        std::process::exit(2);
+    }
+    let watched: Vec<bool> = (0..launch.specs.len())
+        .map(|p| launch.watches.iter().any(|w| w.proc == p))
+        .collect();
+    match run(&launch.specs, &watched, &config, tx, rx) {
         Ok((names, started, statuses)) => {
             print_final_statuses(&names, &started, &statuses);
         }
@@ -108,14 +127,36 @@ fn main() {
     }
 }
 
+/// Everything `main` decides before the terminal is touched.
+#[derive(Debug)]
+struct Launch {
+    specs: Vec<ProcSpec>,
+    timeout: Option<Duration>,
+    /// Quiet period for watch-triggered restarts; 100 ms unless the file
+    /// says otherwise.
+    debounce: Duration,
+    /// The Krawattefile's directory; `None` in ad-hoc mode.
+    project_dir: Option<PathBuf>,
+    watches: Vec<SlotWatch>,
+}
+
+const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(100);
+
 /// Where the cluster comes from: positional commands run ad hoc; otherwise
 /// the Krawattefile given with `-f`, or the nearest one above the current
 /// directory. Errors are complete, user-facing messages (without the
-/// `krawatte:` prefix), all of them at once.
-fn resolve_specs(cli: &Cli) -> Result<(Vec<ProcSpec>, Option<Duration>), Vec<String>> {
+/// `krawatte:` prefix), all of them at once; watch resolution only runs on
+/// a file that parsed cleanly.
+fn resolve_launch(cli: &Cli) -> Result<Launch, Vec<String>> {
     if !cli.commands.is_empty() {
         let specs = cli.commands.iter().map(|c| ProcSpec::adhoc(c)).collect();
-        return Ok((specs, None));
+        return Ok(Launch {
+            specs,
+            timeout: None,
+            debounce: DEFAULT_DEBOUNCE,
+            project_dir: None,
+            watches: Vec::new(),
+        });
     }
     let path = match &cli.file {
         Some(path) => path.clone(),
@@ -131,9 +172,18 @@ fn resolve_specs(cli: &Cli) -> Result<(Vec<ProcSpec>, Option<Duration>), Vec<Str
             })?
         }
     };
-    let file = config::load(&path)
-        .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())?;
-    Ok((file.procs, file.timeout))
+    let as_messages = |errors: Vec<config::ConfigError>| {
+        errors.iter().map(ToString::to_string).collect::<Vec<_>>()
+    };
+    let file = config::load(&path).map_err(as_messages)?;
+    let watches = watch::resolve_all(&file).map_err(as_messages)?;
+    Ok(Launch {
+        watches,
+        debounce: file.debounce.unwrap_or(DEFAULT_DEBOUNCE),
+        project_dir: Some(file.project_dir),
+        specs: file.procs,
+        timeout: file.timeout,
+    })
 }
 
 /// An explicit `-t` wins over the file's `settings.timeout`, which wins over
@@ -150,8 +200,13 @@ fn grace_period(cli_secs: Option<f64>, file_timeout: Option<Duration>) -> Durati
 /// terminal has been restored.
 type RunResult = (Vec<String>, Vec<bool>, Vec<Option<ExitStatus>>);
 
-fn run(specs: &[ProcSpec], config: &Config) -> io::Result<RunResult> {
-    let (tx, rx) = mpsc::channel::<Event>();
+fn run(
+    specs: &[ProcSpec],
+    watched: &[bool],
+    config: &Config,
+    tx: mpsc::Sender<Event>,
+    rx: mpsc::Receiver<Event>,
+) -> io::Result<RunResult> {
     let mut manager = ProcManager::spawn_specs(specs, config, tx);
     let mut buffers = BufferSet::new(specs.len(), config);
 
@@ -162,6 +217,7 @@ fn run(specs: &[ProcSpec], config: &Config) -> io::Result<RunResult> {
         .collect();
     let started: Vec<bool> = (0..manager.len()).map(|p| manager.was_started(p)).collect();
     let mut ui = UiState::new(names.clone());
+    ui.set_watched(watched.to_vec());
 
     // Enter raw mode + alternate screen; the guard restores them on any exit
     // path including panic. Children are killed by `manager.shutdown()` below,
@@ -232,11 +288,13 @@ fn event_loop(
 /// group and still holds the old pipe -- and are dropped. While a teardown is
 /// in flight the dying generation's lines are still shown (its shutdown output
 /// is real), but its exit is not: the slot is `Restarting`, not `✖ sig 15`.
+/// A `Changed` event restarts its slot with the configured command unless a
+/// restart is already in flight, in which case it is dropped.
 fn drain_events(
     rx: &mpsc::Receiver<Event>,
     buffers: &mut BufferSet,
     ui: &mut UiState,
-    manager: &ProcManager,
+    manager: &mut ProcManager,
 ) {
     for ev in rx.try_iter() {
         match ev {
@@ -266,8 +324,21 @@ fn drain_events(
                     ui.set_health(proc, Health::SpawnFailed);
                 }
             }
-            // handled in a later task
-            Event::Changed(_) => {}
+            Event::Changed(changed) => {
+                // Mid-restart the new generation has not spawned yet and will
+                // read the disk as it is then, so a further change adds nothing.
+                if manager.is_restarting(changed.proc) {
+                    continue;
+                }
+                let standard = manager.standard_command(changed.proc).to_string();
+                let trigger = Trigger::Watch {
+                    paths: changed.paths,
+                    more: changed.more,
+                };
+                if manager.replace(changed.proc, standard, trigger) {
+                    ui.set_health(changed.proc, Health::Restarting);
+                }
+            }
         }
     }
 }
@@ -325,7 +396,7 @@ fn status_label(started: bool, status: Option<ExitStatus>) -> String {
 mod tests {
     use super::*;
     use crate::config::{FILE_NAME, Watch};
-    use crate::types::{Gen, StreamTag, Trigger};
+    use crate::types::{Changed, Gen, StreamTag, Trigger};
     use std::fs;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -347,7 +418,8 @@ mod tests {
 
     #[test]
     fn positional_commands_become_adhoc_specs() {
-        let (specs, timeout) = resolve_specs(&cli(&["npm run dev", "cargo check"])).unwrap();
+        let launch = resolve_launch(&cli(&["npm run dev", "cargo check"])).unwrap();
+        let (specs, timeout) = (launch.specs, launch.timeout);
         assert_eq!(timeout, None);
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].name, "npm");
@@ -361,10 +433,11 @@ mod tests {
         let file = dir.path().join(FILE_NAME);
         fs::write(
             &file,
-            "[settings]\ntimeout = 1.5\n[[proc]]\nname = \"a\"\ncmd = \"true\"\nwatch = \"self\"\n",
+            "[settings]\ntimeout = 1.5\n[[proc]]\nname = \"a\"\ncmd = \"./app\"\nwatch = \"self\"\n",
         )
         .unwrap();
-        let (specs, timeout) = resolve_specs(&cli(&["-f", file.to_str().unwrap()])).unwrap();
+        let launch = resolve_launch(&cli(&["-f", file.to_str().unwrap()])).unwrap();
+        let (specs, timeout) = (launch.specs, launch.timeout);
         assert_eq!(timeout, Some(Duration::from_secs_f64(1.5)));
         assert_eq!(specs[0].name, "a");
         assert_eq!(
@@ -379,12 +452,102 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(FILE_NAME);
         fs::write(&file, "[[proc]]\nname = \"all\"\ncmd = \"true\"\n").unwrap();
-        let errs = resolve_specs(&cli(&["-f", file.to_str().unwrap()])).unwrap_err();
+        let errs = resolve_launch(&cli(&["-f", file.to_str().unwrap()])).unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("is reserved"), "{}", errs[0]);
 
-        let errs = resolve_specs(&cli(&["-f", "/nonexistent/Krawattefile"])).unwrap_err();
+        let errs = resolve_launch(&cli(&["-f", "/nonexistent/Krawattefile"])).unwrap_err();
         assert!(errs[0].contains("cannot read"), "{}", errs[0]);
+    }
+
+    #[test]
+    fn launch_from_a_file_resolves_watches_and_debounce() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        let file = dir.path().join(FILE_NAME);
+        fs::write(&file, "[settings]\ndebounce_ms = 20\n[[proc]]\nname = \"a\"\ncmd = \"true\"\nwatch = [\"src\"]\n[[proc]]\nname = \"b\"\ncmd = \"true\"\n").unwrap();
+        let launch = resolve_launch(&cli(&["-f", file.to_str().unwrap()])).unwrap();
+        assert_eq!(launch.debounce, Duration::from_millis(20));
+        assert_eq!(launch.watches.len(), 1);
+        assert_eq!(launch.watches[0].proc, 0);
+        assert_eq!(launch.project_dir, Some(dir.path().canonicalize().unwrap()));
+
+        let adhoc = resolve_launch(&cli(&["true"])).unwrap();
+        assert!(adhoc.watches.is_empty());
+        assert_eq!(adhoc.debounce, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn watch_resolution_errors_join_the_config_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(FILE_NAME);
+        fs::write(
+            &file,
+            "[[proc]]\nname = \"all\"\ncmd = \"npm x\"\nwatch = \"self\"\n",
+        )
+        .unwrap();
+        let errs = resolve_launch(&cli(&["-f", file.to_str().unwrap()])).unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+        assert!(
+            errs[0].contains("is reserved"),
+            "parse errors come first and stop resolution: {errs:#?}"
+        );
+
+        fs::write(
+            &file,
+            "[[proc]]\nname = \"web\"\ncmd = \"npm x\"\nwatch = \"self\"\n",
+        )
+        .unwrap();
+        let errs = resolve_launch(&cli(&["-f", file.to_str().unwrap()])).unwrap_err();
+        assert!(errs[0].contains("$PATH"), "{errs:#?}");
+    }
+
+    #[test]
+    fn a_change_restarts_the_slot_unless_a_restart_is_in_flight() {
+        let (tx, rx) = mpsc::channel();
+        let config = Config {
+            grace_period: Duration::from_millis(200),
+            ..Config::default()
+        };
+        let mut manager = ProcManager::spawn_all(&["sleep 30".to_string()], &config, tx.clone());
+        let mut buffers = BufferSet::new(1, &config);
+        let mut ui = UiState::new(vec!["sleep".to_string()]);
+        let changed = || {
+            Event::Changed(Changed {
+                proc: 0,
+                paths: vec!["src/a.rs".into()],
+                more: 0,
+            })
+        };
+
+        tx.send(changed()).unwrap();
+        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
+        assert!(manager.is_restarting(0));
+        assert_eq!(ui.health(0), Health::Restarting);
+
+        // In flight: a second change is dropped, not queued.
+        tx.send(changed()).unwrap();
+        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut transitions = Vec::new();
+        while transitions.is_empty() && Instant::now() < deadline {
+            transitions = manager.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let t = transitions.pop().expect("one restart");
+        assert_eq!(
+            t.trigger,
+            Trigger::Watch {
+                paths: vec!["src/a.rs".into()],
+                more: 0
+            }
+        );
+        assert_eq!(t.new.command, "sleep 30");
+        assert!(
+            !manager.is_restarting(0),
+            "the dropped change did not queue another"
+        );
+        manager.shutdown();
     }
 
     #[test]
@@ -435,7 +598,7 @@ mod tests {
             status: ExitStatus::Signal(15),
         })
         .unwrap();
-        drain_events(&rx, &mut buffers, &mut ui, &manager);
+        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
         assert_eq!(buffers.buffer(0).len(), 1);
         assert_eq!(ui.health(0), Health::Restarting);
 
@@ -443,7 +606,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut transitions = Vec::new();
         while transitions.is_empty() && Instant::now() < deadline {
-            drain_events(&rx, &mut buffers, &mut ui, &manager);
+            drain_events(&rx, &mut buffers, &mut ui, &mut manager);
             transitions = manager.tick();
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -463,7 +626,7 @@ mod tests {
         // After the swap, generation 0 is stale and generation 1 is live.
         tx.send(line(0, 0, "late")).unwrap();
         tx.send(line(0, 1, "fresh")).unwrap();
-        drain_events(&rx, &mut buffers, &mut ui, &manager);
+        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
         assert_eq!(buffers.buffer(0).len(), 6);
         assert_eq!(ui.health(0), Health::Running);
 

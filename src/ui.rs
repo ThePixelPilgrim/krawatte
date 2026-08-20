@@ -209,6 +209,8 @@ pub struct UiState {
     proc_count: usize,
     /// Short display name per process, shown in the status bar.
     names: Vec<String>,
+    /// Which slots restart on file changes; shown as a dim `w`.
+    watched: Vec<bool>,
     view: View,
     health: Vec<Health>,
     /// Number of lines scrolled up from the bottom. `0` == following the tail.
@@ -246,6 +248,7 @@ impl UiState {
         UiState {
             proc_count,
             names,
+            watched: vec![false; proc_count],
             view: View::All,
             health: vec![Health::Running; proc_count],
             scroll_offset: 0,
@@ -448,33 +451,53 @@ impl UiState {
         self.render_body(frame, chunks[1], buffers, now);
     }
 
+    /// Mark which slots are watched for changes.
+    pub fn set_watched(&mut self, watched: Vec<bool>) {
+        self.watched = watched;
+    }
+
+    /// The status-bar spans for one slot: index, name, optional `w`, health.
+    /// Factored out of the bar so it can be tested as plain text.
+    pub fn slot_label(&self, p: ProcId) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        let idx_style = if matches!(self.view, View::Single(sel) if sel == p) {
+            Style::default()
+                .fg(proc_color(p))
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default()
+                .fg(proc_color(p))
+                .add_modifier(Modifier::BOLD)
+        };
+        let health = self.health.get(p).copied().unwrap_or(Health::Running);
+        let (glyph, gstyle) = health_glyph(health);
+        spans.push(Span::styled(format!("[{}]", p + 1), idx_style));
+        spans.push(Span::raw(" "));
+        if let Some(name) = self.names.get(p) {
+            spans.push(Span::styled(
+                name.clone(),
+                Style::default().fg(proc_color(p)),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        if self.watched.get(p).copied().unwrap_or(false) {
+            spans.push(Span::styled(
+                "w",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(glyph, gstyle));
+        spans
+    }
+
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for p in 0..self.proc_count {
             if p > 0 {
                 spans.push(Span::raw("  "));
             }
-            let idx_style = if matches!(self.view, View::Single(sel) if sel == p) {
-                Style::default()
-                    .fg(proc_color(p))
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else {
-                Style::default()
-                    .fg(proc_color(p))
-                    .add_modifier(Modifier::BOLD)
-            };
-            let health = self.health.get(p).copied().unwrap_or(Health::Running);
-            let (glyph, gstyle) = health_glyph(health);
-            spans.push(Span::styled(format!("[{}]", p + 1), idx_style));
-            spans.push(Span::raw(" "));
-            if let Some(name) = self.names.get(p) {
-                spans.push(Span::styled(
-                    name.clone(),
-                    Style::default().fg(proc_color(p)),
-                ));
-                spans.push(Span::raw(" "));
-            }
-            spans.push(Span::styled(glyph, gstyle));
+            spans.extend(self.slot_label(p));
         }
         let follow_marker = if self.following() {
             Span::styled(" FOLLOW", Style::default().fg(Color::Green))
@@ -1430,5 +1453,17 @@ mod tests {
     #[allow(dead_code)]
     fn _kind_marker() -> KeyEventKind {
         KeyEventKind::Press
+    }
+
+    #[test]
+    fn watched_slots_show_a_dim_w_after_the_name() {
+        let mut s = ui(2);
+        s.set_watched(vec![true, false]);
+        let first = TuiLine::from(s.slot_label(0));
+        let second = TuiLine::from(s.slot_label(1));
+        assert_eq!(plain(&first), "[1] p0 w ●");
+        assert_eq!(plain(&second), "[2] p1 ●");
+        let w = first.spans.iter().find(|sp| sp.content == "w").unwrap();
+        assert!(w.style.add_modifier.contains(Modifier::DIM));
     }
 }

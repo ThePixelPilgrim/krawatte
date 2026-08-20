@@ -4,8 +4,6 @@
 //! Resolution and debouncing are pure and unit-tested; only [`start`] talks
 //! to `notify`.
 
-#![allow(dead_code)] // wired in by a later task
-
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
