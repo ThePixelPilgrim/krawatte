@@ -13,6 +13,7 @@ mod types;
 mod ui;
 
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
@@ -26,6 +27,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::buffer::{BufferSet, StyledLine};
+use crate::config::ProcSpec;
 use crate::proc::{ProcManager, Transition};
 use crate::types::{Config, Event, ExitStatus, Health};
 use crate::ui::{Action, UiState};
@@ -54,16 +56,23 @@ impl Drop for TerminalGuard {
 
 /// Full-screen terminal multi-tail: run several programs, follow their output
 /// interleaved or per pane, shut them all down with one Ctrl-C.
+///
+/// With no COMMAND arguments, launches the nearest Krawattefile (in the
+/// current directory or a parent) or the one given with --file.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
     /// Grace period in seconds between SIGTERM and SIGKILL during shutdown.
-    #[arg(short, long, default_value_t = 5.0, value_name = "SECS")]
-    timeout: f64,
+    /// Overrides a Krawattefile's settings.timeout [default: 5].
+    #[arg(short, long, value_name = "SECS")]
+    timeout: Option<f64>,
 
-    /// Shell commands to run; each argument is passed to `sh -c`.
+    /// Krawattefile to launch instead of searching for one.
+    #[arg(short, long, value_name = "PATH", conflicts_with = "commands")]
+    file: Option<PathBuf>,
+
+    /// Shell commands to run ad hoc; each argument is passed to `sh -c`.
     #[arg(
-        required = true,
         value_name = "COMMAND",
         trailing_var_arg = true,
         allow_hyphen_values = true
@@ -74,11 +83,20 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
+    let (specs, file_timeout) = match resolve_specs(&cli) {
+        Ok(resolved) => resolved,
+        Err(messages) => {
+            for m in messages {
+                eprintln!("krawatte: {m}");
+            }
+            std::process::exit(2);
+        }
+    };
     let config = Config {
-        grace_period: Duration::from_secs_f64(cli.timeout.max(0.0)),
+        grace_period: grace_period(cli.timeout, file_timeout),
         ..Config::default()
     };
-    match run(&cli.commands, &config) {
+    match run(&specs, &config) {
         Ok((names, started, statuses)) => {
             print_final_statuses(&names, &started, &statuses);
         }
@@ -89,15 +107,52 @@ fn main() {
     }
 }
 
+/// Where the cluster comes from: positional commands run ad hoc; otherwise
+/// the Krawattefile given with `-f`, or the nearest one above the current
+/// directory. Errors are complete, user-facing messages (without the
+/// `krawatte:` prefix), all of them at once.
+fn resolve_specs(cli: &Cli) -> Result<(Vec<ProcSpec>, Option<Duration>), Vec<String>> {
+    if !cli.commands.is_empty() {
+        let specs = cli.commands.iter().map(|c| ProcSpec::adhoc(c)).collect();
+        return Ok((specs, None));
+    }
+    let path = match &cli.file {
+        Some(path) => path.clone(),
+        None => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| vec![format!("cannot determine the current directory: {e}")])?;
+            config::discover(&cwd).ok_or_else(|| {
+                vec![format!(
+                    "no {} found in {} or any parent directory (pass commands to run ad hoc, or -f PATH)",
+                    config::FILE_NAME,
+                    cwd.display()
+                )]
+            })?
+        }
+    };
+    let file = config::load(&path)
+        .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())?;
+    Ok((file.procs, file.timeout))
+}
+
+/// An explicit `-t` wins over the file's `settings.timeout`, which wins over
+/// the default of five seconds. Negative values clamp to zero.
+fn grace_period(cli_secs: Option<f64>, file_timeout: Option<Duration>) -> Duration {
+    cli_secs
+        .map(|t| Duration::from_secs_f64(t.max(0.0)))
+        .or(file_timeout)
+        .unwrap_or(Duration::from_secs(5))
+}
+
 /// Set up the terminal, spawn children, run the event loop, then shut down.
 /// Returns the per-process final statuses (indexed by [`ProcId`]) once the
 /// terminal has been restored.
 type RunResult = (Vec<String>, Vec<bool>, Vec<Option<ExitStatus>>);
 
-fn run(commands: &[String], config: &Config) -> io::Result<RunResult> {
+fn run(specs: &[ProcSpec], config: &Config) -> io::Result<RunResult> {
     let (tx, rx) = mpsc::channel::<Event>();
-    let mut manager = ProcManager::spawn_all(commands, config, tx);
-    let mut buffers = BufferSet::new(commands.len(), config);
+    let mut manager = ProcManager::spawn_specs(specs, config, tx);
+    let mut buffers = BufferSet::new(specs.len(), config);
 
     // Short display names for the status bar (and the final printout). Captured
     // up front so both the live UI and the post-shutdown summary can label slots.
@@ -266,8 +321,82 @@ fn status_label(started: bool, status: Option<ExitStatus>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{FILE_NAME, Watch};
     use crate::types::{Gen, StreamTag};
+    use std::fs;
+    use std::path::PathBuf;
     use std::time::Instant;
+
+    fn cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("krawatte").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn cli_accepts_no_arguments_and_rejects_file_with_commands() {
+        assert!(cli(&[]).commands.is_empty());
+        assert_eq!(cli(&["-t", "2", "a", "b"]).commands, vec!["a", "b"]);
+        assert_eq!(
+            cli(&["-f", "x/Krawattefile"]).file,
+            Some(PathBuf::from("x/Krawattefile"))
+        );
+        assert!(Cli::try_parse_from(["krawatte", "-f", "x", "cmd"]).is_err());
+    }
+
+    #[test]
+    fn positional_commands_become_adhoc_specs() {
+        let (specs, timeout) = resolve_specs(&cli(&["npm run dev", "cargo check"])).unwrap();
+        assert_eq!(timeout, None);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "npm");
+        assert_eq!(specs[0].cwd, None);
+        assert_eq!(specs[1].command, "cargo check");
+    }
+
+    #[test]
+    fn explicit_file_is_loaded_and_its_timeout_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(FILE_NAME);
+        fs::write(
+            &file,
+            "[settings]\ntimeout = 1.5\n[[proc]]\nname = \"a\"\ncmd = \"true\"\nwatch = \"self\"\n",
+        )
+        .unwrap();
+        let (specs, timeout) = resolve_specs(&cli(&["-f", file.to_str().unwrap()])).unwrap();
+        assert_eq!(timeout, Some(Duration::from_secs_f64(1.5)));
+        assert_eq!(specs[0].name, "a");
+        assert_eq!(
+            specs[0].cwd.as_deref(),
+            Some(dir.path().canonicalize().unwrap().as_path())
+        );
+        assert_eq!(specs[0].watch, Watch::SelfBinary);
+    }
+
+    #[test]
+    fn config_errors_are_returned_as_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(FILE_NAME);
+        fs::write(&file, "[[proc]]\nname = \"all\"\ncmd = \"true\"\n").unwrap();
+        let errs = resolve_specs(&cli(&["-f", file.to_str().unwrap()])).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("is reserved"), "{}", errs[0]);
+
+        let errs = resolve_specs(&cli(&["-f", "/nonexistent/Krawattefile"])).unwrap_err();
+        assert!(errs[0].contains("cannot read"), "{}", errs[0]);
+    }
+
+    #[test]
+    fn grace_period_prefers_cli_then_file_then_default() {
+        assert_eq!(
+            grace_period(Some(2.0), Some(Duration::from_secs(7))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            grace_period(None, Some(Duration::from_secs(7))),
+            Duration::from_secs(7)
+        );
+        assert_eq!(grace_period(None, None), Duration::from_secs(5));
+        assert_eq!(grace_period(Some(-1.0), None), Duration::ZERO);
+    }
 
     fn line(proc: usize, r#gen: Gen, text: &str) -> Event {
         Event::Line {

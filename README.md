@@ -6,15 +6,24 @@ single Ctrl-C.
 
 ## Usage
 
+Ad hoc — each argument is one command, run via `sh -c` in its own process
+group:
+
 ```
 krawatte "cargo watch -x check" "npm run dev" "python worker.py"
 ```
 
-Each argument is one command, run via `sh -c` in its own process group.
+From a project — with no commands, krawatte looks for a `Krawattefile` in the
+current directory or any parent and launches it:
+
+```
+krawatte
+```
 
 | Option | Meaning |
 |---|---|
-| `-t`, `--timeout <SECS>` | grace period between SIGTERM and SIGKILL on shutdown (default `5`) |
+| `-t`, `--timeout <SECS>` | grace period between SIGTERM and SIGKILL on shutdown (overrides the file's `settings.timeout`; default `5`) |
+| `-f`, `--file <PATH>` | launch this Krawattefile instead of searching for one; cannot be combined with commands |
 
 ## Keys
 
@@ -29,6 +38,34 @@ Each argument is one command, run via `sh -c` in its own process group.
 | `k` | kill the viewed pane's process; it is restarted like `r` (no-op in the all-view) |
 | `PgUp`/`PgDn`/`↑`/`↓` | scroll (returning to the bottom resumes follow) |
 | `q` or Ctrl-C | shut down all children and exit |
+
+## Krawattefile
+
+TOML. Every relative path is resolved against the directory containing the
+file (the *project dir*), and a process without `cwd` runs there — never in
+the directory krawatte happened to be started from.
+
+```toml
+[settings]
+timeout = 5.0                 # optional; seconds of grace on shutdown
+
+[[proc]]
+name = "build"                # required; unique; letters, digits, `_`, `-`; not all digits; not `all`
+cmd  = "cargo build -p app"   # required; run via `sh -c`
+
+[[proc]]
+name = "web"
+cmd  = "npm run dev"
+cwd  = "frontend"             # optional; relative to the project dir; must exist
+env  = { PORT = "5174" }      # optional; added to the inherited environment
+```
+
+Unknown keys are errors. All problems in the file are reported together,
+with line numbers, before the terminal is touched (exit code 2). Slots
+appear in file order and the status bar shows their names.
+
+`watch` and `ignore` keys are accepted and reserved for restart-on-change;
+see `docs/superpowers/specs/2026-08-20-file-watching-design.md`.
 
 ## Behavior
 

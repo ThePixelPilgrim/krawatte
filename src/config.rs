@@ -5,10 +5,6 @@
 //! line numbers taken from `toml`'s spans, so one round trip fixes the file.
 //! Apart from checking that a `cwd` exists this module is pure.
 
-// Wired in by a later task: nothing outside the tests calls into this module
-// until discovery (Task 2) and the CLI (Task 4) land. Remove then.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;

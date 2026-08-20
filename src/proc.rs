@@ -136,9 +136,11 @@ pub struct ProcManager {
 }
 
 impl ProcManager {
-    /// Spawn every positional command (each a string run via `sh -c`) as an
-    /// ad-hoc slot: named by its basename, inheriting krawatte's cwd and
-    /// environment. See [`spawn_specs`](Self::spawn_specs).
+    /// Spawn every command (each a string run via `sh -c`) as an ad-hoc
+    /// slot: named by its basename, inheriting krawatte's cwd and
+    /// environment. A test convenience over [`spawn_specs`](Self::spawn_specs);
+    /// `main` builds its specs through `resolve_specs` instead.
+    #[cfg(test)]
     pub fn spawn_all(commands: &[String], config: &Config, tx: Sender<Event>) -> ProcManager {
         let specs: Vec<ProcSpec> = commands.iter().map(|c| ProcSpec::adhoc(c)).collect();
         Self::spawn_specs(&specs, config, tx)
