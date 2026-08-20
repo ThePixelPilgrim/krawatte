@@ -32,10 +32,28 @@ callers now even though this spec only wires the two hotkeys.
 - The status bar shows `↻` for a slot whose generation is being torn down
   (`Health::Restarting`). Once the new generation is spawned it is `●` again;
   the old generation's signalled exit never shows as `✖`.
-- The buffer is kept. When the new generation spawns, a separator line
-  `── restarted HH:MM:SS ──` is appended to the slot's buffer, dim, without a
-  stream tag; it appears in the pane and the all-view like any other line and
-  is scrolled, timestamped and wrapped the same way.
+- The buffer is kept. When the new generation spawns, a block of *marker
+  lines* is appended to the slot's buffer — dim, without a stream tag —
+  exposing everything relevant about the transition. One topic per line so
+  no line grows long; the only unbounded field, the command, gets its own
+  line and is clipped/wrapped like any other line:
+
+  ```
+  ── restart · gen 2 → 3 · 14:02:11 ──
+  ── gen 2: pid 47105 · killed by signal 15 · ran 4m12s ──
+  ── gen 3: pid 48213 ──
+  ── cmd: target/debug/erhebimus ──
+  ```
+
+  The old-generation line reports how it ended (`exit N`, `killed by signal
+  N`, `abandoned` if it survived SIGKILL, `never started` for a slot that had
+  no live generation) and how long it ran. If the new generation fails to
+  spawn, its line reads `── gen 3: spawn failed: <error> ──`. Marker lines
+  appear in the pane and the all-view like any other line and are scrolled,
+  timestamped and wrapped the same way. Spec C adds a `trigger` field
+  (`key r`, `key k`, `watch`, `cli`) to the header line once there is more
+  than one way to get here; in this spec the trigger is always a key and is
+  omitted.
 - `q`/Ctrl-C during an in-flight restart shuts down normally and within the
   usual bound.
 
@@ -121,9 +139,12 @@ holds a port the new one fails on its own terms and that shows as `✖`.
 
 `Action` gains `Restart(ProcId)` and `Kill(ProcId)`, returned by `handle_key`
 only from a single-pane view; the all-view returns `Continue`. `Health` gains
-`Restarting`, rendered `↻`. The separator is a `StyledLine` with a new
+`Restarting`, rendered `↻`. Each marker line is a `StyledLine` with a new
 `StreamTag::Marker` (no tag column, dim style) so the buffer needs no
-special-casing beyond rendering the tag.
+special-casing beyond rendering the tag. `Respawned` (returned by `tick`)
+carries the old generation's pid, outcome and runtime, the new pid or spawn
+error, and the command, so `main` can format the block without reaching into
+the manager.
 
 ### Testing
 
@@ -139,7 +160,9 @@ special-casing beyond rendering the tag.
   - global shutdown started mid-restart returns within the bound;
   - a background job left in the old group is killed by the restart.
 - UI tests: `r`/`k` return `Continue` in the all-view and the right action in
-  a pane; `Restarting` health renders; separator line renders without a tag.
+  a pane; `Restarting` health renders; marker lines render without a tag, and
+  the block's formatting covers every outcome (exit, signal, abandoned, never
+  started, spawn failed).
 
 ## Out of scope
 
