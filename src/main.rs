@@ -9,6 +9,7 @@ mod buffer;
 mod config;
 mod marker;
 mod proc;
+mod protocol;
 mod types;
 mod ui;
 mod watch;
