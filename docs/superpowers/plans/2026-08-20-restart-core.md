@@ -1,6 +1,8 @@
 # Restart Core Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Red–green TDD is mandatory** (see Global Constraints): test first, watch it fail, then implement. Use superpowers:test-driven-development for every task.
 
 **Goal:** A slot can be torn down and respawned in place (`r`/`k` hotkeys) without blocking the UI, keeping its index, name and buffer, and writing a marker block into the buffer describing the transition.
 
@@ -12,6 +14,16 @@
 
 ## Global Constraints
 
+- **Red–green TDD is mandatory.** For every behavior change: write the test
+  first, run it and *observe it fail for the expected reason* (red), write
+  the minimal code that makes it pass, run it and observe it pass (green),
+  then refactor with the suite green. Never write implementation code before
+  the red run has been seen; a test that passes on first run is a test that
+  proves nothing — fix it until it fails without the implementation. Each
+  task below is laid out in that order; do not reorder steps or batch
+  several tasks' implementation ahead of their tests. The only exception is
+  Task 2, a pure refactor: it adds no behavior and is covered by keeping the
+  existing suite green after every edit.
 - Linux/Unix only; process groups and POSIX signals via `nix`.
 - `cargo test` and `cargo clippy --all-targets` are clean at the start (69 tests) and must stay clean after every task.
 - Shutdown and restart must stay bounded: nothing may ever block on pipe EOF or on a process that survived SIGKILL (see the `waiter` comment in `proc.rs`).
