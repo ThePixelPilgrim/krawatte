@@ -26,23 +26,30 @@ use nix::unistd::{Pid, setpgid};
 
 use crate::types::{Config, Event, ExitStatus, Gen, ProcId, Seq, StreamTag};
 
-/// Per-child state retained by the manager after spawning.
-struct Proc {
-    /// Full command string (as passed to `sh -c`). Retained for diagnostics.
+/// One spawn of a slot's command. A slot holds at most one generation that may
+/// still be alive; a restart tears it down and replaces it.
+struct Generation {
+    /// Which generation of its slot this is; `0` for the initial spawn.
+    #[allow(dead_code)]
+    r#gen: Gen,
+    /// The command this generation runs (as passed to `sh -c`).
     #[allow(dead_code)]
     command: String,
-    /// Precomputed short display name for the status bar.
-    short: String,
-    /// Process-group id used for signalling (equal to the child's pid, since it
-    /// leads its own group). `None` for a slot that failed to spawn.
-    pgid: Option<Pid>,
+    /// Pid of the `sh` that leads this generation's process group.
+    #[allow(dead_code)]
+    pid: i32,
+    /// Process-group id used for signalling (equal to `pid`, since the child
+    /// leads its own group).
+    pgid: Pid,
+    /// When the generation was spawned, for the runtime reported on restart.
+    #[allow(dead_code)]
+    started: Instant,
     /// Set to `true` by the waiter thread once the child has been reaped.
     dead: Arc<AtomicBool>,
-    /// Final exit status, filled in by the waiter thread. `None` while running
-    /// or for a spawn failure.
+    /// Final exit status, filled in by the waiter thread. `None` while running.
     status: Arc<Mutex<Option<ExitStatus>>>,
     /// Join handle for the waiter thread. Safe to join once `dead` is set;
-    /// `None` for a slot that failed to spawn or that has already been joined.
+    /// `None` once joined.
     ///
     /// The two reader threads deliberately have no handles here: they block in
     /// `read()` until *every* holder of the pipe's write end closes it, and that
@@ -51,16 +58,37 @@ struct Proc {
     /// event krawatte cannot force, so readers are detached and left to be
     /// cleaned up by process exit.
     waiter: Option<JoinHandle<()>>,
-    /// Set by [`ProcManager::shutdown`] once this slot's process group has been
-    /// confirmed empty, so the drop guard knows not to signal the pgid again
-    /// (by then the kernel may have recycled it for an unrelated process).
+    /// Set once this generation's process group has been confirmed empty, so
+    /// nothing signals the pgid again (by then the kernel may have recycled it
+    /// for an unrelated process).
     finished: bool,
+}
+
+/// Per-slot state: the configured command and the current generation.
+struct Proc {
+    /// The slot's configured command (the CLI argument).
+    #[allow(dead_code)]
+    standard: String,
+    /// Precomputed short display name for the status bar.
+    short: String,
+    /// Number of the most recent generation; `0` for the initial spawn.
+    #[allow(dead_code)]
+    r#gen: Gen,
+    /// The most recent generation, or `None` if the slot has never spawned
+    /// successfully.
+    live: Option<Generation>,
 }
 
 /// Manages the full set of child processes and the shared event channel.
 pub struct ProcManager {
     procs: Vec<Proc>,
     grace_period: Duration,
+    /// Shell every command is run through (`sh` outside tests).
+    shell: String,
+    /// One shared, monotonically increasing sequence counter across every
+    /// process and both streams, so the all-view can reconstruct arrival order.
+    seq: Arc<AtomicU64>,
+    tx: Sender<Event>,
 }
 
 impl ProcManager {
@@ -80,48 +108,34 @@ impl ProcManager {
         tx: Sender<Event>,
         shell: &str,
     ) -> ProcManager {
-        // One shared, monotonically increasing sequence counter across every
-        // process and both streams, so the all-view can reconstruct arrival
-        // order.
-        let seq = Arc::new(AtomicU64::new(0));
-        let mut procs = Vec::with_capacity(commands.len());
-
+        let mut mgr = ProcManager {
+            procs: Vec::with_capacity(commands.len()),
+            grace_period: config.grace_period,
+            shell: shell.to_string(),
+            seq: Arc::new(AtomicU64::new(0)),
+            tx,
+        };
         for (proc, command) in commands.iter().enumerate() {
-            let short = short_name_of(command);
-            match spawn_one(proc, 0, shell, command, &seq, &tx) {
-                Ok((pgid, dead, status, waiter)) => procs.push(Proc {
-                    command: command.clone(),
-                    short,
-                    pgid: Some(pgid),
-                    dead,
-                    status,
-                    waiter: Some(waiter),
-                    finished: false,
-                }),
+            let live = match spawn_one(proc, 0, &mgr.shell, command, &mgr.seq, &mgr.tx) {
+                Ok(generation) => Some(generation),
                 Err(err) => {
-                    // Spawn failure: report it and record an immediately-dead slot.
-                    let _ = tx.send(Event::SpawnFailed {
+                    // Spawn failure: report it and record a slot with no generation.
+                    let _ = mgr.tx.send(Event::SpawnFailed {
                         proc,
                         r#gen: 0,
                         error: err.to_string(),
                     });
-                    procs.push(Proc {
-                        command: command.clone(),
-                        short,
-                        pgid: None,
-                        dead: Arc::new(AtomicBool::new(true)),
-                        status: Arc::new(Mutex::new(None)),
-                        waiter: None,
-                        finished: true,
-                    });
+                    None
                 }
-            }
+            };
+            mgr.procs.push(Proc {
+                standard: command.clone(),
+                short: short_name_of(command),
+                r#gen: 0,
+                live,
+            });
         }
-
-        ProcManager {
-            procs,
-            grace_period: config.grace_period,
-        }
+        mgr
     }
 
     /// Number of processes managed.
@@ -132,7 +146,11 @@ impl ProcManager {
     /// True if no live children remain.
     #[allow(dead_code)]
     pub fn all_dead(&self) -> bool {
-        self.procs.iter().all(|p| p.dead.load(Ordering::SeqCst))
+        self.procs.iter().all(|p| {
+            p.live
+                .as_ref()
+                .is_none_or(|g| g.dead.load(Ordering::SeqCst))
+        })
     }
 
     /// Run the orderly shutdown sequence: SIGTERM every live process group,
@@ -148,7 +166,7 @@ impl ProcManager {
             .procs
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.pgid.is_some())
+            .filter(|(_, p)| p.live.is_some())
             .map(|(i, _)| i)
             .collect();
 
@@ -159,27 +177,25 @@ impl ProcManager {
 
         // Join the waiter threads -- bounded, since a waiter is all but finished
         // once it has published `dead` -- and collect the recorded statuses. The
-        // reader threads are never joined; see the `waiter` field on `Proc`.
-        for p in &mut self.procs {
-            if let Some(pgid) = p.pgid {
-                p.finished = p.dead.load(Ordering::SeqCst) && group_gone(pgid);
-            }
-            if p.dead.load(Ordering::SeqCst)
-                && let Some(h) = p.waiter.take()
+        // reader threads are never joined; see the `waiter` field on `Generation`.
+        for g in self.procs.iter_mut().filter_map(|p| p.live.as_mut()) {
+            g.finished = g.dead.load(Ordering::SeqCst) && group_gone(g.pgid);
+            if g.dead.load(Ordering::SeqCst)
+                && let Some(h) = g.waiter.take()
             {
                 let _ = h.join();
             }
         }
         self.procs
             .iter()
-            .map(|p| *p.status.lock().unwrap())
+            .map(|p| p.live.as_ref().and_then(|g| *g.status.lock().unwrap()))
             .collect()
     }
 
     /// Whether this slot's command actually spawned (and so has a process
     /// group), as opposed to having failed at `spawn` time.
     pub fn was_started(&self, proc: ProcId) -> bool {
-        self.procs[proc].pgid.is_some()
+        self.procs[proc].live.is_some()
     }
 
     /// Short display name derived from a process's command line (for the status
@@ -197,16 +213,14 @@ impl Drop for ProcManager {
     /// group not yet confirmed empty, then join whichever waiters have already
     /// published `dead`. Nothing here waits on an unbounded event.
     fn drop(&mut self) {
-        for p in &self.procs {
-            if let Some(pgid) = p.pgid
-                && !p.finished
-            {
-                let _ = killpg(pgid, Signal::SIGKILL);
+        for g in self.procs.iter().filter_map(|p| p.live.as_ref()) {
+            if !g.finished {
+                let _ = killpg(g.pgid, Signal::SIGKILL);
             }
         }
-        for p in &mut self.procs {
-            if p.dead.load(Ordering::SeqCst)
-                && let Some(h) = p.waiter.take()
+        for g in self.procs.iter_mut().filter_map(|p| p.live.as_mut()) {
+            if g.dead.load(Ordering::SeqCst)
+                && let Some(h) = g.waiter.take()
             {
                 let _ = h.join();
             }
@@ -216,13 +230,6 @@ impl Drop for ProcManager {
 
 /// Spawn a single child in its own process group, wiring reader threads for
 /// stdout/stderr and a waiter thread that reaps and reports the exit.
-type SpawnParts = (
-    Pid,
-    Arc<AtomicBool>,
-    Arc<Mutex<Option<ExitStatus>>>,
-    JoinHandle<()>,
-);
-
 fn spawn_one(
     proc: ProcId,
     r#gen: Gen,
@@ -230,7 +237,7 @@ fn spawn_one(
     command: &str,
     seq: &Arc<AtomicU64>,
     tx: &Sender<Event>,
-) -> std::io::Result<SpawnParts> {
+) -> std::io::Result<Generation> {
     let mut cmd = Command::new(shell);
     cmd.arg("-c")
         .arg(command)
@@ -255,7 +262,7 @@ fn spawn_one(
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
-    // Detached on purpose -- see the `waiter` field on `Proc`.
+    // Detached on purpose -- see the `waiter` field on `Generation`.
     spawn_reader(
         proc,
         r#gen,
@@ -294,7 +301,17 @@ fn spawn_one(
         });
     });
 
-    Ok((pgid, dead, status, waiter))
+    Ok(Generation {
+        r#gen,
+        command: command.to_string(),
+        pid,
+        pgid,
+        started: Instant::now(),
+        dead,
+        status,
+        waiter: Some(waiter),
+        finished: false,
+    })
 }
 
 /// Spawn a detached line-reader thread for one stream, emitting [`Event::Line`]
@@ -563,14 +580,14 @@ struct RealEffects<'a> {
 
 impl ShutdownEffects for RealEffects<'_> {
     fn term(&mut self, proc: ProcId) {
-        if let Some(pgid) = self.mgr.procs[proc].pgid {
-            let _ = killpg(pgid, Signal::SIGTERM);
+        if let Some(g) = &self.mgr.procs[proc].live {
+            let _ = killpg(g.pgid, Signal::SIGTERM);
         }
     }
 
     fn kill(&mut self, proc: ProcId) {
-        if let Some(pgid) = self.mgr.procs[proc].pgid {
-            let _ = killpg(pgid, Signal::SIGKILL);
+        if let Some(g) = &self.mgr.procs[proc].live {
+            let _ = killpg(g.pgid, Signal::SIGKILL);
         }
     }
 
@@ -582,7 +599,11 @@ impl ShutdownEffects for RealEffects<'_> {
             .procs
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.dead.load(Ordering::SeqCst) && p.pgid.is_none_or(group_gone))
+            .filter(|(_, p)| {
+                p.live
+                    .as_ref()
+                    .is_none_or(|g| g.dead.load(Ordering::SeqCst) && group_gone(g.pgid))
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -787,7 +808,7 @@ mod tests {
         );
         assert_eq!(mgr.len(), 1);
         // The slot has no process group and is immediately dead.
-        assert!(mgr.procs[0].pgid.is_none());
+        assert!(mgr.procs[0].live.is_none());
         assert!(mgr.all_dead());
         // A SpawnFailed event was delivered for this slot.
         let saw_spawn_failed = rx
