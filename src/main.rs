@@ -15,8 +15,9 @@ mod types;
 mod ui;
 mod watch;
 
+use std::collections::HashSet;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
@@ -32,7 +33,8 @@ use ratatui::backend::CrosstermBackend;
 use crate::buffer::{BufferSet, StyledLine};
 use crate::config::ProcSpec;
 use crate::proc::{GenKind, Outcome, ProcManager, Transition};
-use crate::types::{Config, Event, ExitStatus, Health, Trigger};
+use crate::protocol::Response;
+use crate::types::{Config, Event, ExitStatus, Health, ProcId, Trigger};
 use crate::ui::{Action, UiState};
 use crate::watch::SlotWatch;
 
@@ -118,7 +120,26 @@ fn main() {
     let watched: Vec<bool> = (0..launch.specs.len())
         .map(|p| launch.watches.iter().any(|w| w.proc == p))
         .collect();
-    match run(&launch.specs, &watched, &config, tx, rx) {
+    let project_dir = launch
+        .project_dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    let control = match control::Listener::bind(&control::socket_path(&project_dir)) {
+        Ok(mut l) => {
+            l.serve(tx.clone());
+            ControlState::On(l)
+        }
+        Err(e) => ControlState::Failed(e.to_string()),
+    };
+    match run(
+        &launch.specs,
+        &watched,
+        &config,
+        tx,
+        rx,
+        control,
+        project_dir,
+    ) {
         Ok((names, started, statuses)) => {
             print_final_statuses(&names, &started, &statuses);
         }
@@ -202,12 +223,30 @@ fn grace_period(cli_secs: Option<f64>, file_timeout: Option<Duration>) -> Durati
 /// terminal has been restored.
 type RunResult = (Vec<String>, Vec<bool>, Vec<Option<ExitStatus>>);
 
+/// Whether this instance listens on its control socket. `Failed` is reported
+/// in the status bar and, once the terminal is restored, on stderr.
+enum ControlState {
+    /// Held for its `Drop`, which unlinks the socket.
+    On(#[allow(dead_code)] control::Listener),
+    Failed(String),
+}
+
+/// A `--wait` reply parked until every slot it started has transitioned.
+struct Waiter {
+    outstanding: HashSet<ProcId>,
+    reply: mpsc::Sender<Response>,
+    partial: Response,
+    markers: Vec<String>,
+}
+
 fn run(
     specs: &[ProcSpec],
     watched: &[bool],
     config: &Config,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
+    control: ControlState,
+    project_dir: PathBuf,
 ) -> io::Result<RunResult> {
     let mut manager = ProcManager::spawn_specs(specs, config, tx);
     let mut buffers = BufferSet::new(specs.len(), config);
@@ -220,6 +259,10 @@ fn run(
     let started: Vec<bool> = (0..manager.len()).map(|p| manager.was_started(p)).collect();
     let mut ui = UiState::new(names.clone());
     ui.set_watched(watched.to_vec());
+    ui.set_control(match &control {
+        ControlState::On(_) => Some(true),
+        ControlState::Failed(_) => Some(false),
+    });
 
     // Enter raw mode + alternate screen; the guard restores them on any exit
     // path including panic. Children are killed by `manager.shutdown()` below,
@@ -229,12 +272,25 @@ fn run(
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend)?;
 
-        event_loop(&mut terminal, &mut manager, &mut buffers, &mut ui, &rx)?;
+        event_loop(
+            &mut terminal,
+            &mut manager,
+            &mut buffers,
+            &mut ui,
+            &rx,
+            &project_dir,
+        )?;
 
         // Orderly shutdown while still inside the alternate screen; collect
         // final statuses, then drop the guard to restore the terminal.
         manager.shutdown()
     };
+    // The listener outlives the children so the socket is unlinked only once
+    // they are gone: a client's `quit --wait` sees the connection close then.
+    if let ControlState::Failed(msg) = &control {
+        eprintln!("krawatte: control socket unavailable: {msg}");
+    }
+    drop(control);
 
     Ok((names, started, statuses))
 }
@@ -247,7 +303,9 @@ fn event_loop(
     buffers: &mut BufferSet,
     ui: &mut UiState,
     rx: &mpsc::Receiver<Event>,
+    project_dir: &Path,
 ) -> io::Result<()> {
+    let mut waiters: Vec<Waiter> = Vec::new();
     loop {
         terminal.draw(|frame| ui.render(frame, buffers))?;
 
@@ -276,9 +334,11 @@ fn event_loop(
 
         // Drain all currently-available process events into the buffers / UI,
         // then advance any in-flight restarts.
-        drain_events(rx, buffers, ui, manager);
+        if drain_events(rx, buffers, ui, manager, &mut waiters, project_dir) {
+            return Ok(());
+        }
         for t in manager.tick() {
-            apply_transition(&t, manager, buffers, ui);
+            apply_transition(&t, manager, buffers, ui, &mut waiters);
         }
     }
 }
@@ -291,13 +351,18 @@ fn event_loop(
 /// in flight the dying generation's lines are still shown (its shutdown output
 /// is real), but its exit is not: the slot is `Restarting`, not `✖ sig 15`.
 /// A `Changed` event restarts its slot with the configured command unless a
-/// restart is already in flight, in which case it is dropped.
+/// restart is already in flight, in which case it is dropped. Control
+/// requests are answered through [`control::handle`]; `--wait` replies are
+/// parked in `waiters`. Returns true when a client asked the instance to quit.
 fn drain_events(
     rx: &mpsc::Receiver<Event>,
     buffers: &mut BufferSet,
     ui: &mut UiState,
     manager: &mut ProcManager,
-) {
+    waiters: &mut Vec<Waiter>,
+    project_dir: &Path,
+) -> bool {
+    let mut quit = false;
     for ev in rx.try_iter() {
         match ev {
             Event::Line {
@@ -354,28 +419,71 @@ fn drain_events(
                     ui.set_health(changed.proc, Health::Restarting);
                 }
             }
-            Event::Control { .. } => {} // routed in a later task
+            Event::Control { request, reply } => {
+                let ctx = control::Ctx {
+                    manager,
+                    buffers,
+                    ui,
+                    project_dir,
+                };
+                match control::handle(&request, ctx) {
+                    control::Handled::Now(r) => {
+                        let _ = reply.send(r);
+                    }
+                    control::Handled::AfterTransitions { procs, partial } => {
+                        waiters.push(Waiter {
+                            outstanding: procs,
+                            reply,
+                            partial,
+                            markers: Vec::new(),
+                        });
+                    }
+                    control::Handled::Quit(r) => {
+                        let _ = reply.send(r);
+                        quit = true;
+                    }
+                }
+            }
         }
     }
+    quit
 }
 
-/// Record a completed restart in the slot's buffer and set its health.
+/// Record a completed restart in the slot's buffer and set its health; any
+/// `--wait` reply that was waiting on this slot collects the marker block and
+/// is sent once its last slot has transitioned.
 fn apply_transition(
     t: &Transition,
     manager: &ProcManager,
     buffers: &mut BufferSet,
     ui: &mut UiState,
+    waiters: &mut Vec<Waiter>,
 ) {
     let at = SystemTime::now();
-    for text in marker::restart_block(t, &ui.clock(at)) {
+    let block = marker::restart_block(t, &ui.clock(at));
+    for text in &block {
         buffers.push(StyledLine::marker(
             t.proc,
             manager.current_gen(t.proc),
             manager.next_seq(),
             at,
-            text,
+            text.clone(),
         ));
     }
+    waiters.retain_mut(|w| {
+        if !w.outstanding.remove(&t.proc) {
+            return true;
+        }
+        w.markers.extend(block.iter().cloned());
+        if !w.outstanding.is_empty() {
+            return true;
+        }
+        if let Response::Acted { markers, .. } = &mut w.partial {
+            *markers = Some(std::mem::take(&mut w.markers));
+        }
+        let _ = w.reply.send(w.partial.clone());
+        false
+    });
     let health = match (&t.new, &t.old) {
         (Some(n), _) => match n.spawn {
             Ok(_) => Health::Running,
@@ -428,6 +536,7 @@ fn status_label(started: bool, status: Option<ExitStatus>) -> String {
 mod tests {
     use super::*;
     use crate::config::{FILE_NAME, Watch};
+    use crate::protocol::{Request, Response};
     use crate::types::{Changed, Gen, StreamTag, Trigger};
     use std::fs;
     use std::path::PathBuf;
@@ -564,13 +673,27 @@ mod tests {
         };
 
         tx.send(changed()).unwrap();
-        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
+        drain_events(
+            &rx,
+            &mut buffers,
+            &mut ui,
+            &mut manager,
+            &mut Vec::new(),
+            &PathBuf::from("/p"),
+        );
         assert!(manager.is_restarting(0));
         assert_eq!(ui.health(0), Health::Restarting);
 
         // In flight: a second change is dropped, not queued.
         tx.send(changed()).unwrap();
-        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
+        drain_events(
+            &rx,
+            &mut buffers,
+            &mut ui,
+            &mut manager,
+            &mut Vec::new(),
+            &PathBuf::from("/p"),
+        );
         let t = tick_until(&mut manager, Duration::from_secs(5));
         assert_eq!(
             t.trigger,
@@ -635,13 +758,20 @@ mod tests {
             status: ExitStatus::Signal(15),
         })
         .unwrap();
-        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
+        drain_events(
+            &rx,
+            &mut buffers,
+            &mut ui,
+            &mut manager,
+            &mut Vec::new(),
+            &PathBuf::from("/p"),
+        );
         assert_eq!(buffers.buffer(0).len(), 1);
         assert_eq!(ui.health(0), Health::Restarting);
 
         // Drive the restart to completion.
         let t = tick_until(&mut manager, Duration::from_secs(5));
-        apply_transition(&t, &manager, &mut buffers, &mut ui);
+        apply_transition(&t, &manager, &mut buffers, &mut ui, &mut Vec::new());
         assert_eq!(ui.health(0), Health::Running);
         // The four-line marker block followed the one real line.
         assert_eq!(buffers.buffer(0).len(), 5);
@@ -656,7 +786,14 @@ mod tests {
         // After the swap, generation 0 is stale and generation 1 is live.
         tx.send(line(0, 0, "late")).unwrap();
         tx.send(line(0, 1, "fresh")).unwrap();
-        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
+        drain_events(
+            &rx,
+            &mut buffers,
+            &mut ui,
+            &mut manager,
+            &mut Vec::new(),
+            &PathBuf::from("/p"),
+        );
         assert_eq!(buffers.buffer(0).len(), 6);
         assert_eq!(ui.health(0), Health::Running);
 
@@ -681,7 +818,7 @@ mod tests {
             Trigger::Cli("run".into())
         ));
         let t = tick_until(&mut manager, Duration::from_secs(5));
-        apply_transition(&t, &manager, &mut buffers, &mut ui);
+        apply_transition(&t, &manager, &mut buffers, &mut ui, &mut Vec::new());
         assert!(ui.override_marked(0));
 
         // Wait for `true` to exit, then let the main loop see it.
@@ -690,7 +827,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         std::thread::sleep(Duration::from_millis(50));
-        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
+        drain_events(
+            &rx,
+            &mut buffers,
+            &mut ui,
+            &mut manager,
+            &mut Vec::new(),
+            &PathBuf::from("/p"),
+        );
         assert!(
             manager.is_restarting(0),
             "self-exit of an override starts the resume"
@@ -698,7 +842,7 @@ mod tests {
         let t = tick_until(&mut manager, Duration::from_secs(5));
         assert_eq!(t.trigger, Trigger::Resume);
         assert_eq!(t.new.as_ref().unwrap().command, "sleep 30");
-        apply_transition(&t, &manager, &mut buffers, &mut ui);
+        apply_transition(&t, &manager, &mut buffers, &mut ui, &mut Vec::new());
         assert!(!manager.is_override(0));
         assert!(!ui.override_marked(0));
         assert_eq!(ui.health(0), Health::Running);
@@ -729,9 +873,99 @@ mod tests {
             more: 0,
         }))
         .unwrap();
-        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
+        drain_events(
+            &rx,
+            &mut buffers,
+            &mut ui,
+            &mut manager,
+            &mut Vec::new(),
+            &PathBuf::from("/p"),
+        );
         assert!(!manager.is_restarting(0));
         assert_eq!(manager.current_command(0), "sleep 31");
+        manager.shutdown();
+    }
+
+    #[test]
+    fn control_requests_are_answered_and_wait_replies_carry_markers() {
+        let (tx, rx) = mpsc::channel();
+        let config = Config {
+            grace_period: Duration::from_millis(200),
+            ..Config::default()
+        };
+        let mut manager = ProcManager::spawn_all(&["sleep 30".to_string()], &config, tx.clone());
+        let mut buffers = BufferSet::new(1, &config);
+        let mut ui = UiState::new(vec!["sleep".to_string()]);
+        let mut waiters = Vec::new();
+        let dir = PathBuf::from("/p");
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(Event::Control {
+            request: Request::Status,
+            reply: reply_tx,
+        })
+        .unwrap();
+        assert!(!drain_events(
+            &rx,
+            &mut buffers,
+            &mut ui,
+            &mut manager,
+            &mut waiters,
+            &dir
+        ));
+        assert!(matches!(
+            reply_rx.try_recv().unwrap(),
+            Response::Status { .. }
+        ));
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(Event::Control {
+            request: Request::Restart {
+                slot: "1".into(),
+                wait: true,
+            },
+            reply: reply_tx,
+        })
+        .unwrap();
+        assert!(!drain_events(
+            &rx,
+            &mut buffers,
+            &mut ui,
+            &mut manager,
+            &mut waiters,
+            &dir
+        ));
+        assert_eq!(waiters.len(), 1);
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "not answered before the transition"
+        );
+        let t = tick_until(&mut manager, Duration::from_secs(5));
+        apply_transition(&t, &manager, &mut buffers, &mut ui, &mut waiters);
+        assert!(waiters.is_empty());
+        let Response::Acted {
+            markers: Some(markers),
+            ..
+        } = reply_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!()
+        };
+        assert!(markers[0].contains("cli restart"), "{markers:?}");
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(Event::Control {
+            request: Request::Quit,
+            reply: reply_tx,
+        })
+        .unwrap();
+        assert!(
+            drain_events(&rx, &mut buffers, &mut ui, &mut manager, &mut waiters, &dir),
+            "quit requested"
+        );
+        assert!(matches!(
+            reply_rx.try_recv().unwrap(),
+            Response::Done { ok: true }
+        ));
         manager.shutdown();
     }
 

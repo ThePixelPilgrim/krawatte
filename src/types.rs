@@ -89,7 +89,6 @@ pub enum Event {
     /// Watched paths of a slot changed; see [`Changed`].
     Changed(Changed),
     /// A request from the control socket; answer on `reply`.
-    #[allow(dead_code)] // read by the main loop, a later task
     Control {
         request: crate::protocol::Request,
         reply: std::sync::mpsc::Sender<crate::protocol::Response>,

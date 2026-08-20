@@ -1,7 +1,6 @@
 //! The control socket: where it lives, how it is bound and served, and how
 //! a request is answered. `handle` is pure given the manager and is the
 //! unit-test surface; the socket code is a thin threaded shell around it.
-#![allow(dead_code)] // wired into the main loop by a later task
 
 use std::collections::HashSet;
 use std::fs;
@@ -109,6 +108,7 @@ impl Listener {
         })
     }
 
+    #[allow(dead_code)] // test-only accessor
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -228,6 +228,7 @@ pub fn resolve_slot(manager: &ProcManager, slot: &str) -> Result<Vec<ProcId>, St
 
 /// `30s`, `5m`, `1h30m`, `250ms`. A bare number is rejected rather than
 /// guessed at.
+#[allow(dead_code)] // used by the CLI client, a later task
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let bad = || format!("invalid duration {s:?}: use units like 30s, 5m, 1h30m");
     if s.is_empty() {

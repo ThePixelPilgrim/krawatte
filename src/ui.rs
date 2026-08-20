@@ -285,7 +285,6 @@ impl UiState {
     }
 
     /// Record the control-socket state for the status bar.
-    #[allow(dead_code)] // set by the listener lifecycle, a later task
     pub fn set_control(&mut self, control: Option<bool>) {
         self.control = control;
     }
