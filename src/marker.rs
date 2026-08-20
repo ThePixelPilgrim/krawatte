@@ -12,7 +12,6 @@ use crate::types::ExitStatus;
 /// The lines describing a completed transition, in buffer order. `clock` is
 /// the already-formatted local time of the transition (`HH:MM:SS`);
 /// formatting time is the UI's job, since only it knows the timezone.
-#[allow(dead_code)] // wired into main.rs by a later task
 pub fn restart_block(t: &Transition, clock: &str) -> Vec<String> {
     let mut lines = Vec::with_capacity(4);
 

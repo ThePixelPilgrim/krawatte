@@ -52,7 +52,6 @@ impl StyledLine {
     /// A line krawatte inserts itself (a restart marker): plain text, no ANSI
     /// parsing, tagged [`StreamTag::Marker`] so the UI renders it as a note
     /// rather than as process output.
-    #[allow(dead_code)] // wired into main.rs by a later task
     pub fn marker(proc: ProcId, seq: Seq, at: SystemTime, text: String) -> StyledLine {
         StyledLine {
             proc,

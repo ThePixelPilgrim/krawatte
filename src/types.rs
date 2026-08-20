@@ -46,8 +46,6 @@ pub enum Health {
     /// Process is alive and running.
     Running,
     /// The current generation is being torn down ahead of a respawn.
-    // TODO(Task 7): drop the allow once main.rs sets this on restart.
-    #[allow(dead_code)]
     Restarting,
     /// Process exited cleanly (`exit 0`).
     ExitedOk,
@@ -68,7 +66,6 @@ pub enum Event {
     /// buffer).
     Line {
         proc: ProcId,
-        #[allow(dead_code)]
         r#gen: Gen,
         stream: StreamTag,
         seq: Seq,
@@ -78,14 +75,12 @@ pub enum Event {
     /// A child process exited and was reaped.
     Exited {
         proc: ProcId,
-        #[allow(dead_code)]
         r#gen: Gen,
         status: ExitStatus,
     },
     /// A command failed to spawn.
     SpawnFailed {
         proc: ProcId,
-        #[allow(dead_code)]
         r#gen: Gen,
         #[allow(dead_code)]
         error: String,

@@ -276,7 +276,6 @@ impl UiState {
     /// Local time of day of `at` as `HH:MM:SS`, in the UI's timezone. Used for
     /// the restart marker header, which is text stored in the buffer and so is
     /// formatted once, at insertion, unlike the live timestamp prefix.
-    #[allow(dead_code)] // wired into main.rs by a later task
     pub fn clock(&self, at: SystemTime) -> String {
         format_time_only(at, &self.tz)
     }
@@ -301,8 +300,7 @@ impl UiState {
     }
 
     /// Current health of a slot, as shown in the status bar.
-    // TODO(Task 7): drop the allow once main.rs uses this.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // test-only accessor
     pub fn health(&self, proc: ProcId) -> Health {
         self.health.get(proc).copied().unwrap_or(Health::Running)
     }

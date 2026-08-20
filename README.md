@@ -25,13 +25,15 @@ Each argument is one command, run via `sh -c` in its own process group.
 | `0` or `a` | interleaved all-view |
 | `d` | cycle line timestamps: off → ISO datetime → time only → relative |
 | `w` | toggle wrapping of over-wide lines onto continuation rows |
+| `r` | restart the viewed pane's process (no-op in the all-view) |
+| `k` | kill the viewed pane's process; it is restarted like `r` (no-op in the all-view) |
 | `PgUp`/`PgDn`/`↑`/`↓` | scroll (returning to the bottom resumes follow) |
 | `q` or Ctrl-C | shut down all children and exit |
 
 ## Behavior
 
 - **Status bar** shows each process slot: index, command name, and health
-  (`●` running, `✔ exit 0`, `✖ exit N`).
+  (`●` running, `↻` restarting, `✔ exit 0`, `✖ exit N`).
 - **Interleaved view** merges all outputs in arrival order, each line prefixed
   with a colored per-process tag; single panes show one program in isolation.
 - **Scrollback**: ~10,000 lines per process, ANSI colors preserved.
@@ -44,6 +46,14 @@ Each argument is one command, run via `sh -c` in its own process group.
   toggling keeps the line you were reading at the bottom of the viewport.
 - **A child exiting** marks its slot dead (exit code shown); the others keep
   running and its buffer stays viewable.
+- **Restart** (`r`/`k` in a single pane) sends SIGTERM to that child's process
+  group, waits out the grace period, SIGKILLs stragglers, then runs the same
+  command again in the same slot. The UI stays live throughout; the slot shows
+  `↻` while the old process is being torn down. The buffer is kept and a dim
+  marker block records the transition — generation numbers, pids, how the old
+  process ended and how long it ran, and the command. Output that arrives late
+  from the old process is discarded. A child that exits on its own is *not*
+  restarted.
 - **Ctrl-C / `q`** sends SIGTERM to every child's process group, waits out the
   grace period (`--timeout`, default 5s), SIGKILLs stragglers, reaps
   everything, restores the terminal, and prints each child's final status.

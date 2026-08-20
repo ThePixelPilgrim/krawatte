@@ -13,7 +13,7 @@ mod ui;
 
 use std::io::{self, Stdout};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use crossterm::ExecutableCommand;
@@ -25,7 +25,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::buffer::{BufferSet, StyledLine};
-use crate::proc::ProcManager;
+use crate::proc::{ProcManager, Transition};
 use crate::types::{Config, Event, ExitStatus, Health};
 use crate::ui::{Action, UiState};
 
@@ -141,46 +141,94 @@ fn event_loop(
         if event::poll(Duration::from_millis(50))?
             && let CtEvent::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && ui.handle_key(key) == Action::Quit
         {
-            return Ok(());
+            match ui.handle_key(key) {
+                Action::Quit => return Ok(()),
+                Action::Restart(p) => {
+                    let command = manager.current_command(p).to_string();
+                    if manager.replace(p, command) {
+                        ui.set_health(p, Health::Restarting);
+                    }
+                }
+                Action::Kill(p) => {
+                    if manager.kill(p) {
+                        ui.set_health(p, Health::Restarting);
+                    }
+                }
+                Action::Continue => {}
+            }
         }
 
-        // Drain all currently-available process events into the buffers / UI.
+        // Drain all currently-available process events into the buffers / UI,
+        // then advance any in-flight restarts.
         drain_events(rx, buffers, ui, manager);
+        for t in manager.tick() {
+            apply_transition(&t, manager, buffers, ui);
+        }
     }
 }
 
 /// Apply every currently-pending process event to the buffers and UI health.
+///
+/// Events from a generation other than the slot's current one are stale --
+/// late output from a replaced process, or from a grandchild that escaped its
+/// group and still holds the old pipe -- and are dropped. While a teardown is
+/// in flight the dying generation's lines are still shown (its shutdown output
+/// is real), but its exit is not: the slot is `Restarting`, not `✖ sig 15`.
 fn drain_events(
     rx: &mpsc::Receiver<Event>,
     buffers: &mut BufferSet,
     ui: &mut UiState,
     manager: &ProcManager,
 ) {
-    let n = manager.len();
     for ev in rx.try_iter() {
         match ev {
             Event::Line {
                 proc,
-                r#gen: _,
+                r#gen,
                 stream,
                 seq,
                 at,
                 bytes,
             } => {
-                if proc < n {
+                if manager.is_current(proc, r#gen) {
                     buffers.push(StyledLine::parse(proc, stream, seq, at, &bytes));
                 }
             }
-            Event::Exited { proc, status, .. } => {
-                ui.set_health(proc, health_from_exit(status));
+            Event::Exited {
+                proc,
+                r#gen,
+                status,
+            } => {
+                if manager.is_current(proc, r#gen) && !manager.is_restarting(proc) {
+                    ui.set_health(proc, health_from_exit(status));
+                }
             }
-            Event::SpawnFailed { proc, .. } => {
-                ui.set_health(proc, Health::SpawnFailed);
+            Event::SpawnFailed { proc, r#gen, .. } => {
+                if manager.is_current(proc, r#gen) {
+                    ui.set_health(proc, Health::SpawnFailed);
+                }
             }
         }
     }
+}
+
+/// Record a completed restart in the slot's buffer and set its health.
+fn apply_transition(
+    t: &Transition,
+    manager: &ProcManager,
+    buffers: &mut BufferSet,
+    ui: &mut UiState,
+) {
+    let at = SystemTime::now();
+    for text in marker::restart_block(t, &ui.clock(at)) {
+        buffers.push(StyledLine::marker(t.proc, manager.next_seq(), at, text));
+    }
+    let health = match t.new.spawn {
+        Ok(_) => Health::Running,
+        Err(_) => Health::SpawnFailed,
+    };
+    ui.set_health(t.proc, health);
 }
 
 /// Map a terminal exit status to a [`Health`] for the status bar.
@@ -217,6 +265,77 @@ fn status_label(started: bool, status: Option<ExitStatus>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Gen, StreamTag};
+    use std::time::Instant;
+
+    fn line(proc: usize, r#gen: Gen, text: &str) -> Event {
+        Event::Line {
+            proc,
+            r#gen,
+            stream: StreamTag::Stdout,
+            seq: 0,
+            at: SystemTime::UNIX_EPOCH,
+            bytes: text.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn stale_generation_events_are_dropped_and_transitions_write_markers() {
+        let (tx, rx) = mpsc::channel();
+        let config = Config {
+            grace_period: Duration::from_millis(200),
+            ..Config::default()
+        };
+        let mut manager = ProcManager::spawn_all(&["sleep 30".to_string()], &config, tx.clone());
+        let mut buffers = BufferSet::new(1, &config);
+        let mut ui = UiState::new(vec!["sleep".to_string()]);
+
+        assert!(manager.replace(0, "sleep 30".to_string()));
+        ui.set_health(0, Health::Restarting);
+
+        // Mid-teardown: output from the dying generation is still shown, but
+        // its exit must not flip the health away from Restarting.
+        tx.send(line(0, 0, "shutting down")).unwrap();
+        tx.send(Event::Exited {
+            proc: 0,
+            r#gen: 0,
+            status: ExitStatus::Signal(15),
+        })
+        .unwrap();
+        drain_events(&rx, &mut buffers, &mut ui, &manager);
+        assert_eq!(buffers.buffer(0).len(), 1);
+        assert_eq!(ui.health(0), Health::Restarting);
+
+        // Drive the restart to completion.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut transitions = Vec::new();
+        while transitions.is_empty() && Instant::now() < deadline {
+            drain_events(&rx, &mut buffers, &mut ui, &manager);
+            transitions = manager.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let t = transitions.pop().expect("restart completed");
+        apply_transition(&t, &manager, &mut buffers, &mut ui);
+        assert_eq!(ui.health(0), Health::Running);
+        // The four-line marker block followed the one real line.
+        assert_eq!(buffers.buffer(0).len(), 5);
+        assert!(
+            buffers
+                .buffer(0)
+                .iter()
+                .skip(1)
+                .all(|l| l.stream == StreamTag::Marker)
+        );
+
+        // After the swap, generation 0 is stale and generation 1 is live.
+        tx.send(line(0, 0, "late")).unwrap();
+        tx.send(line(0, 1, "fresh")).unwrap();
+        drain_events(&rx, &mut buffers, &mut ui, &manager);
+        assert_eq!(buffers.buffer(0).len(), 6);
+        assert_eq!(ui.health(0), Health::Running);
+
+        manager.shutdown();
+    }
 
     #[test]
     fn status_label_distinguishes_never_started_from_never_exited() {

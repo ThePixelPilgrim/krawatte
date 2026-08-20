@@ -77,7 +77,6 @@ struct Proc {
 
 /// An in-flight restart: the teardown of the current generation, and what to
 /// run once it is gone.
-#[allow(dead_code)] // wired into main.rs by a later task
 struct Restart {
     /// Single-slot TERM -> grace -> KILL machine; starts `Done` if there was
     /// nothing to tear down.
@@ -88,7 +87,6 @@ struct Restart {
 
 /// How a generation ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // wired into main.rs by a later task
 pub enum Outcome {
     /// Reaped with this status.
     Exited(ExitStatus),
@@ -99,7 +97,6 @@ pub enum Outcome {
 
 /// The generation a [`Transition`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // wired into main.rs by a later task
 pub struct OldGen {
     pub r#gen: Gen,
     pub pid: i32,
@@ -110,7 +107,6 @@ pub struct OldGen {
 
 /// The generation a [`Transition`] started.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // wired into main.rs by a later task
 pub struct NewGen {
     pub r#gen: Gen,
     pub command: String,
@@ -121,7 +117,6 @@ pub struct NewGen {
 /// A completed slot transition, reported by [`ProcManager::tick`] so the
 /// caller can record it in the slot's buffer and update the health display.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // wired into main.rs by a later task
 pub struct Transition {
     pub proc: ProcId,
     /// `None` when the slot had no generation to end (it never started).
@@ -262,7 +257,6 @@ impl ProcManager {
     /// spawn `command` in its place. Non-blocking: the teardown is driven by
     /// [`tick`](Self::tick). Returns `false`, doing nothing, if a restart is
     /// already in flight.
-    #[allow(dead_code)] // wired into main.rs by a later task
     pub fn replace(&mut self, proc: ProcId, command: String) -> bool {
         let slot = &mut self.procs[proc];
         if slot.restart.is_some() {
@@ -294,7 +288,6 @@ impl ProcManager {
     /// so this equals [`replace`](Self::replace) with the current command; it
     /// diverges once an override can run in a slot. Returns `false`, doing
     /// nothing, if a restart is already in flight.
-    #[allow(dead_code)] // wired into main.rs by a later task
     pub fn kill(&mut self, proc: ProcId) -> bool {
         let standard = self.procs[proc].standard.clone();
         self.replace(proc, standard)
@@ -303,7 +296,6 @@ impl ProcManager {
     /// Step every in-flight restart by one poll; spawn the next generation of
     /// each slot whose teardown completed. Returns the completed transitions in
     /// slot order. Call this from the main loop; it never blocks.
-    #[allow(dead_code)] // wired into main.rs by a later task
     pub fn tick(&mut self) -> Vec<Transition> {
         let mut out = Vec::new();
         for proc in 0..self.procs.len() {
@@ -372,7 +364,7 @@ impl ProcManager {
     }
 
     /// Number of the slot's current generation.
-    #[allow(dead_code)] // wired into main.rs by a later task
+    #[allow(dead_code)] // test-only accessor
     pub fn current_gen(&self, proc: ProcId) -> Gen {
         self.procs[proc].r#gen
     }
@@ -380,20 +372,17 @@ impl ProcManager {
     /// Whether an event stamped `gen` belongs to the slot's current generation.
     /// Anything older is stale output from a replaced generation (or from a
     /// grandchild that escaped its group and still holds the old pipe).
-    #[allow(dead_code)] // wired into main.rs by a later task
     pub fn is_current(&self, proc: ProcId, r#gen: Gen) -> bool {
         self.procs.get(proc).is_some_and(|p| p.r#gen == r#gen)
     }
 
     /// Whether a teardown is in flight for this slot.
-    #[allow(dead_code)] // wired into main.rs by a later task
     pub fn is_restarting(&self, proc: ProcId) -> bool {
         self.procs.get(proc).is_some_and(|p| p.restart.is_some())
     }
 
     /// The command the slot's current generation runs; the standard command if
     /// the slot has never spawned.
-    #[allow(dead_code)] // wired into main.rs by a later task
     pub fn current_command(&self, proc: ProcId) -> &str {
         let p = &self.procs[proc];
         p.live.as_ref().map_or(&p.standard, |g| &g.command)
@@ -402,7 +391,6 @@ impl ProcManager {
     /// Hand out the next global sequence number, for lines krawatte inserts
     /// into a buffer itself. Shares the counter the reader threads use, so the
     /// line sorts after everything that arrived before it.
-    #[allow(dead_code)] // wired into main.rs by a later task
     pub fn next_seq(&self) -> Seq {
         self.seq.fetch_add(1, Ordering::SeqCst)
     }
