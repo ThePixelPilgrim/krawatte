@@ -11,6 +11,7 @@ mod marker;
 mod proc;
 mod types;
 mod ui;
+mod watch;
 
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -265,6 +266,8 @@ fn drain_events(
                     ui.set_health(proc, Health::SpawnFailed);
                 }
             }
+            // handled in a later task
+            Event::Changed(_) => {}
         }
     }
 }

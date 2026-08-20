@@ -72,6 +72,8 @@ pub struct Krawattefile {
     pub project_dir: PathBuf,
     /// `settings.timeout`, if given.
     pub timeout: Option<Duration>,
+    /// `settings.debounce_ms`, if given.
+    pub debounce: Option<Duration>,
     pub procs: Vec<ProcSpec>,
 }
 
@@ -113,6 +115,7 @@ struct RawFile {
 #[serde(deny_unknown_fields)]
 struct RawSettings {
     timeout: Option<f64>,
+    debounce_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -165,7 +168,12 @@ pub fn parse(
 
     let mut errors = Vec::new();
 
-    let timeout = match raw.settings.and_then(|s| s.timeout) {
+    let settings = raw.settings;
+    let debounce = settings
+        .as_ref()
+        .and_then(|s| s.debounce_ms)
+        .map(Duration::from_millis);
+    let timeout = match settings.and_then(|s| s.timeout) {
         Some(t) if t < 0.0 => {
             errors.push(err(
                 None,
@@ -257,6 +265,7 @@ pub fn parse(
             path: path.to_path_buf(),
             project_dir: project_dir.to_path_buf(),
             timeout,
+            debounce,
             procs,
         })
     } else {
@@ -393,6 +402,19 @@ ignore = ["*.log"]
         );
         assert_eq!(web.watch, Watch::None);
         assert_eq!(web.ignore, vec!["*.log".to_string()]);
+    }
+
+    #[test]
+    fn debounce_ms_is_parsed_into_a_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let kf = parse_in(
+            dir.path(),
+            "[settings]\ndebounce_ms = 250\n[[proc]]\nname = \"a\"\ncmd = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(kf.debounce, Some(Duration::from_millis(250)));
+        let kf = parse_in(dir.path(), "[[proc]]\nname = \"a\"\ncmd = \"x\"\n").unwrap();
+        assert_eq!(kf.debounce, None);
     }
 
     #[test]

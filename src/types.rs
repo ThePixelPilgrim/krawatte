@@ -86,6 +86,19 @@ pub enum Event {
         #[allow(dead_code)]
         error: String,
     },
+    /// Watched paths of a slot changed; see [`Changed`].
+    #[allow(dead_code)] // constructed by the watcher, wired in by a later task
+    Changed(Changed),
+}
+
+/// A debounced batch of filesystem changes for one slot, sent by the watcher
+/// thread. `paths` are project-relative and capped for display; `more` counts
+/// the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Changed {
+    pub proc: ProcId,
+    pub paths: Vec<PathBuf>,
+    pub more: usize,
 }
 
 /// Runtime configuration.
