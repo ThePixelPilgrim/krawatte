@@ -28,7 +28,6 @@ pub enum StreamTag {
     Stderr,
     /// A line krawatte inserted into a slot's buffer itself (a restart marker),
     /// not process output. Rendered dim, without the stderr marker.
-    #[allow(dead_code)] // constructed from main.rs by a later task
     Marker,
 }
 
