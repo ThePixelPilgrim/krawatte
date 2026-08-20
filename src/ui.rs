@@ -262,6 +262,14 @@ impl UiState {
         self.wrap
     }
 
+    /// Local time of day of `at` as `HH:MM:SS`, in the UI's timezone. Used for
+    /// the restart marker header, which is text stored in the buffer and so is
+    /// formatted once, at insertion, unlike the live timestamp prefix.
+    #[allow(dead_code)] // wired into main.rs by a later task
+    pub fn clock(&self, at: SystemTime) -> String {
+        format_time_only(at, &self.tz)
+    }
+
     /// Current view.
     #[allow(dead_code)]
     pub fn view(&self) -> View {
@@ -654,8 +662,18 @@ fn tagged_line(
         ));
         spans.push(Span::raw(" "));
     }
-    // Clone the parsed content spans into the new owned line.
-    spans.extend(sl.content.spans.iter().cloned());
+    // Clone the parsed content spans into the new owned line. Marker lines are
+    // krawatte's own notes, dimmed so they read as annotations between output.
+    match sl.stream {
+        StreamTag::Marker => spans.extend(
+            sl.content
+                .spans
+                .iter()
+                .cloned()
+                .map(|s| s.patch_style(Style::default().add_modifier(Modifier::DIM))),
+        ),
+        StreamTag::Stdout | StreamTag::Stderr => spans.extend(sl.content.spans.iter().cloned()),
+    }
     (TuiLine::from(spans), prefix_width)
 }
 
@@ -1022,6 +1040,26 @@ mod tests {
         let (stamped, _) = tagged_line(&sl, true, TimeDisplay::TimeOnly, now, &fixed_tz());
         let text: String = stamped.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "14:03:07 1│ hello");
+    }
+
+    #[test]
+    fn marker_lines_render_dim_without_the_stderr_marker() {
+        let now = at(0);
+        let sl = StyledLine::marker(0, 0, now, "── restart ──".to_string());
+        let (line, prefix) = tagged_line(&sl, true, TimeDisplay::Off, now, &fixed_tz());
+        // All-view keeps the process tag so the reader knows which slot it was.
+        assert_eq!(plain(&line), "1│ ── restart ──");
+        assert_eq!(prefix, 3);
+        assert!(line.spans.iter().all(|s| s.content != "!"));
+        let text_span = line.spans.last().unwrap();
+        assert!(text_span.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn clock_formats_local_time_of_day() {
+        let mut s = ui(1);
+        s.tz = fixed_tz();
+        assert_eq!(s.clock(at(3600 * 12 + 3 * 60 + 7)), "14:03:07");
     }
 
     #[test]

@@ -48,6 +48,20 @@ impl StyledLine {
             content,
         }
     }
+
+    /// A line krawatte inserts itself (a restart marker): plain text, no ANSI
+    /// parsing, tagged [`StreamTag::Marker`] so the UI renders it as a note
+    /// rather than as process output.
+    #[allow(dead_code)] // wired into main.rs by a later task
+    pub fn marker(proc: ProcId, seq: Seq, at: SystemTime, text: String) -> StyledLine {
+        StyledLine {
+            proc,
+            stream: StreamTag::Marker,
+            seq,
+            at,
+            content: TuiLine::from(text),
+        }
+    }
 }
 
 /// Convert a single raw line's bytes into a styled ratatui [`TuiLine`].
@@ -349,5 +363,20 @@ mod tests {
         set.push(line(1, 0, "only proc1"));
         assert!(set.buffer(0).is_empty());
         assert_eq!(set.buffer(1).len(), 1);
+    }
+
+    #[test]
+    fn marker_line_is_plain_text_tagged_as_marker() {
+        let sl = StyledLine::marker(2, 7, SystemTime::UNIX_EPOCH, "── restart ──".to_string());
+        assert_eq!(sl.proc, 2);
+        assert_eq!(sl.seq, 7);
+        assert_eq!(sl.stream, StreamTag::Marker);
+        let text: String = sl
+            .content
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "── restart ──");
     }
 }
