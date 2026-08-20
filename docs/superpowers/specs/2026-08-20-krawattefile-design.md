@@ -65,7 +65,7 @@ cwd   = "frontend"
 | Key | Required | Meaning |
 |---|---|---|
 | `settings.timeout` | no | grace period in seconds, default `5`; an explicit `-t` on the CLI wins |
-| `proc.name` | yes | unique; `[A-Za-z0-9_-]+`; not all digits (indices address slots in spec C); not `all` |
+| `proc.name` | yes | unique; `[A-Za-z0-9_-]+`; not all digits (indices address slots in spec C); not the reserved word `all` (addresses every slot in spec C) |
 | `proc.cmd` | yes | run via `sh -c`, as today |
 | `proc.cwd` | no | working directory, relative to the project dir (absolute allowed); must exist at load. **Default: the project dir itself** — never the directory krawatte was launched from, which with walk-up discovery may be any subdirectory |
 | `proc.env` | no | table of string → string, set on top of the inherited environment |
@@ -82,8 +82,14 @@ file path and the TOML line where available:
 
 ```
 krawatte: Krawattefile:9: proc "server": cwd "platform/srv" does not exist
-krawatte: Krawattefile:14: proc name "build" is used twice
+krawatte: Krawattefile:14: proc name "build" is already used by the proc on line 3
+krawatte: Krawattefile:19: proc name "all" is reserved (it addresses every slot in `krawatte restart all` and friends); pick another name
+krawatte: Krawattefile:24: proc name "12" must contain a letter, `_` or `-` (all-digit names would be mistaken for slot indices)
+krawatte: Krawattefile:29: proc name "my proc" may only contain letters, digits, `_` and `-`
 ```
+
+Every name error says *why* the name is rejected and, where it helps, what
+to do instead; a bare "invalid name" is not acceptable.
 
 Exit 2, terminal untouched.
 
