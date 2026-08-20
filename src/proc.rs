@@ -45,6 +45,9 @@ struct Generation {
     dead: Arc<AtomicBool>,
     /// Final exit status, filled in by the waiter thread. `None` while running.
     status: Arc<Mutex<Option<ExitStatus>>>,
+    /// When the waiter reaped the child, so a generation's runtime ends at
+    /// its exit rather than at whatever later moment it is retired.
+    ended: Arc<Mutex<Option<Instant>>>,
     /// Join handle for the waiter thread. Safe to join once `dead` is set;
     /// `None` once joined.
     ///
@@ -59,6 +62,10 @@ struct Generation {
     /// nothing signals the pgid again (by then the kernel may have recycled it
     /// for an unrelated process).
     finished: bool,
+    /// Filled in the first time the generation is retired. A stopped slot
+    /// keeps its dead generation and may be retired again when it is started;
+    /// the second retirement must report the same outcome and runtime.
+    retired: Option<OldGen>,
 }
 
 /// What kind of command a slot's current generation runs.
@@ -430,13 +437,15 @@ impl ProcManager {
                     Err(e.to_string())
                 }
             };
-            self.procs[proc].kind = kind;
             NewGen {
                 r#gen,
                 command,
                 spawn,
             }
         });
+        // Set even when nothing was spawned: a stopped slot runs nothing, so
+        // it is not running an override either.
+        self.procs[proc].kind = kind;
         Transition {
             proc,
             old,
@@ -549,7 +558,13 @@ impl Drop for ProcManager {
 /// waiter if it has finished, mark it so nothing signals the pgid again, and
 /// describe how it ended.
 fn retire(g: &mut Generation, abandoned: bool) -> OldGen {
-    let ran = g.started.elapsed();
+    if let Some(already) = &g.retired {
+        return already.clone();
+    }
+    let ended = *g.ended.lock().unwrap();
+    let ran = ended
+        .unwrap_or_else(Instant::now)
+        .saturating_duration_since(g.started);
     // Join only a waiter that has already published `dead`; an abandoned
     // generation's waiter is still blocked in `wait()`.
     if g.dead.load(Ordering::SeqCst)
@@ -566,12 +581,14 @@ fn retire(g: &mut Generation, abandoned: bool) -> OldGen {
         let status = *g.status.lock().unwrap();
         Outcome::Exited(status.unwrap_or(ExitStatus::Code(-1)))
     };
-    OldGen {
+    let old = OldGen {
         r#gen: g.r#gen,
         pid: g.pid,
         outcome,
         ran,
-    }
+    };
+    g.retired = Some(old.clone());
+    old
 }
 
 /// Spawn a single child in its own process group, wiring reader threads for
@@ -636,9 +653,11 @@ fn spawn_one(
 
     let dead = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new(None));
+    let ended = Arc::new(Mutex::new(None));
 
     let waiter_dead = dead.clone();
     let waiter_status = status.clone();
+    let waiter_ended = ended.clone();
     let waiter_tx = tx.clone();
     let waiter = std::thread::spawn(move || {
         let st = match child.wait() {
@@ -647,6 +666,7 @@ fn spawn_one(
             Err(_) => ExitStatus::Code(-1),
         };
         *waiter_status.lock().unwrap() = Some(st);
+        *waiter_ended.lock().unwrap() = Some(Instant::now());
         waiter_dead.store(true, Ordering::SeqCst);
         let _ = waiter_tx.send(Event::Exited {
             proc,
@@ -664,7 +684,9 @@ fn spawn_one(
         dead,
         status,
         waiter: Some(waiter),
+        ended,
         finished: false,
+        retired: None,
     })
 }
 
@@ -1575,6 +1597,61 @@ mod tests {
         assert_eq!(t.new.unwrap().r#gen, 1);
         assert!(!mgr.is_dead(0));
         assert_eq!(mgr.shutdown().len(), 1);
+    }
+
+    #[test]
+    fn stop_resets_the_kind_to_standard() {
+        let (tx, _rx) = mpsc::channel();
+        let mut mgr = ProcManager::spawn_all(&["sleep 30".to_string()], &short_grace(), tx);
+        assert!(mgr.replace_with(
+            0,
+            "sleep 31".to_string(),
+            GenKind::Override,
+            Trigger::Cli("run".into())
+        ));
+        tick_until_transition(&mut mgr, Duration::from_secs(5));
+        assert!(mgr.is_override(0));
+        assert!(mgr.stop(0, Trigger::Cli("stop".into())));
+        tick_until_transition(&mut mgr, Duration::from_secs(5));
+        // A stopped slot runs nothing, so it cannot be "running an override":
+        // watches must reach it again and the bar must drop the `*`.
+        assert!(!mgr.is_override(0));
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn ran_measures_until_exit_not_until_retirement() {
+        let (tx, _rx) = mpsc::channel();
+        let mut mgr = ProcManager::spawn_all(&["exit 0".to_string()], &short_grace(), tx);
+        wait_until_dead(&mgr);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(mgr.replace(0, "exit 0".to_string(), Trigger::Key('r')));
+        let t = tick_until_transition(&mut mgr, Duration::from_secs(5));
+        let ran = t.old.unwrap().ran;
+        assert!(
+            ran < Duration::from_millis(250),
+            "dead time counted as runtime: {ran:?}"
+        );
+        wait_until_dead(&mgr);
+        mgr.shutdown();
+    }
+
+    #[test]
+    fn a_generation_retired_twice_reports_the_same_outcome() {
+        let (tx, _rx) = mpsc::channel();
+        let mut mgr = ProcManager::spawn_all(&["sleep 30".to_string()], &short_grace(), tx);
+        assert!(mgr.stop(0, Trigger::Cli("stop".into())));
+        let first = tick_until_transition(&mut mgr, Duration::from_secs(5))
+            .old
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let standard = mgr.standard_command(0).to_string();
+        assert!(mgr.replace_with(0, standard, GenKind::Standard, Trigger::Cli("start".into())));
+        let second = tick_until_transition(&mut mgr, Duration::from_secs(5))
+            .old
+            .unwrap();
+        assert_eq!(first, second);
+        mgr.shutdown();
     }
 
     #[test]
