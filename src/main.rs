@@ -6,6 +6,7 @@
 //! (and kills children) even on panic.
 
 mod buffer;
+mod cli;
 mod config;
 mod control;
 mod marker;
@@ -74,20 +75,28 @@ struct Cli {
     timeout: Option<f64>,
 
     /// Krawattefile to launch instead of searching for one.
-    #[arg(short, long, value_name = "PATH", conflicts_with = "commands")]
+    #[arg(short, long, value_name = "PATH", global = true)]
     file: Option<PathBuf>,
+
+    /// Talk to the krawatte already running for this project.
+    #[command(subcommand)]
+    command: Option<cli::Sub>,
 
     /// Shell commands to run ad hoc; each argument is passed to `sh -c`.
     #[arg(
         value_name = "COMMAND",
         trailing_var_arg = true,
-        allow_hyphen_values = true
+        allow_hyphen_values = true,
+        conflicts_with = "file"
     )]
     commands: Vec<String>,
 }
 
 fn main() {
     let cli = Cli::parse();
+    if let Some(sub) = &cli.command {
+        std::process::exit(cli::run_client(sub, cli.file.as_deref()));
+    }
 
     let launch = match resolve_launch(&cli) {
         Ok(launch) => launch,
@@ -566,6 +575,22 @@ mod tests {
             Some(PathBuf::from("x/Krawattefile"))
         );
         assert!(Cli::try_parse_from(["krawatte", "-f", "x", "cmd"]).is_err());
+    }
+
+    #[test]
+    fn subcommands_parse_and_double_dash_keeps_adhoc_commands() {
+        let parsed = cli(&["status"]);
+        assert!(parsed.command.is_some());
+        assert!(parsed.commands.is_empty());
+        assert_eq!(cli(&["--", "status"]).commands, vec!["status"]);
+        assert!(cli(&["--", "status"]).command.is_none());
+        let parsed = cli(&["-f", "x/Krawattefile", "status"]);
+        assert!(parsed.command.is_some());
+        assert_eq!(parsed.file, Some(PathBuf::from("x/Krawattefile")));
+        assert!(matches!(
+            cli(&["restart", "server", "--wait"]).command,
+            Some(cli::Sub::Restart { wait: true, .. })
+        ));
     }
 
     #[test]

@@ -86,7 +86,7 @@ fn trigger_label(trigger: &Trigger) -> String {
 }
 
 /// Whole-second runtime in its two largest units: `12s`, `4m12s`, `2h02m`.
-fn fmt_duration(d: Duration) -> String {
+pub(crate) fn fmt_duration(d: Duration) -> String {
     let secs = d.as_secs();
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     if h > 0 {

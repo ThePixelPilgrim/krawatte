@@ -25,6 +25,14 @@ krawatte
 | `-t`, `--timeout <SECS>` | grace period between SIGTERM and SIGKILL on shutdown (overrides the file's `settings.timeout`; default `5`) |
 | `-f`, `--file <PATH>` | launch this Krawattefile instead of searching for one; cannot be combined with commands |
 
+Talk to an already running instance from anywhere in its project:
+
+```
+krawatte <subcommand>    # status, restart, kill, stop, start, run, quit, logs
+```
+
+See [Controlling a running krawatte](#controlling-a-running-krawatte).
+
 ## Keys
 
 | Key | Action |
@@ -35,7 +43,7 @@ krawatte
 | `d` | cycle line timestamps: off → ISO datetime → time only → relative |
 | `w` | toggle wrapping of over-wide lines onto continuation rows |
 | `r` | restart the viewed pane's process (no-op in the all-view) |
-| `k` | kill the viewed pane's process; it is restarted like `r` (no-op in the all-view) |
+| `k` | kill the viewed pane's process; it is restarted with its standard command, ending any `run` override (no-op in the all-view) |
 | `PgUp`/`PgDn`/`↑`/`↓` | scroll (returning to the bottom resumes follow) |
 | `q` or Ctrl-C | shut down all children and exit |
 
@@ -104,10 +112,49 @@ on source edits and exits with the compiler's status; `server` restarts only
 when the binary actually changes, so a failed build leaves the old server
 running.
 
+## Controlling a running krawatte
+
+While krawatte runs it listens on a unix socket (under `$XDG_RUNTIME_DIR/krawatte/`,
+keyed by the project directory). From anywhere in the project:
+
+```
+krawatte status                      # every slot: health, generation, pid, command
+krawatte restart <SLOT|all> [--wait] # tear down, run the current command again
+krawatte kill    <SLOT|all> [--wait] # tear down, run the standard command
+krawatte stop    <SLOT|all> [--wait] # tear down, leave stopped
+krawatte start   <SLOT|all> [--wait] # start a stopped slot
+krawatte run     <SLOT> [--wait] (-- CMD... | --wrap PREFIX)
+krawatte quit    [--wait]            # like pressing q
+krawatte logs    [SLOT|all] [--tail N] [--since 5m] [--color]
+```
+
+`SLOT` is a name from the Krawattefile or a 1-based index. `--wait` returns
+once the restart has completed and prints its marker block. `--json` on any
+command prints the raw reply, for scripts and agents. `-f PATH` before the
+subcommand addresses the instance launched from that Krawattefile.
+
+`run` puts a one-shot **override** in a slot — `--wrap "perf record -g"`
+prefixes the standard command, `-- cmd args` replaces it — in the slot's
+working directory and environment. When it exits, the standard command
+resumes; `k`/`kill` end it early; `r`/`restart` restart the override itself;
+file watches leave it alone. The status bar marks an override slot with `*`.
+
+The bar shows `CTRL` while the socket is up. If another krawatte already
+serves this project, the new one runs with `NO CTRL`.
+
+Exit codes: `0` ok, `1` refused (unknown slot, restart in flight), `2` usage,
+`3` no instance running for this project.
+
+On the wire each request is one JSON object per line with `"v": 1` and a
+`"cmd"` tag; `run`'s argv travels under the key `"command"`, e.g.
+`{"v":1,"cmd":"run","slot":"server","command":["perf","record"]}`.
+
 ## Behavior
 
 - **Status bar** shows each process slot: index, command name, and health
-  (`●` running, `↻` restarting, `✔ exit 0`, `✖ exit N`).
+  (`●` running, `↻` restarting, `✔ exit 0`, `✖ exit N`). A `*` after the name
+  marks a slot running a `run` override; `CTRL` / `NO CTRL` at the right says
+  whether this instance owns the control socket.
 - **Interleaved view** merges all outputs in arrival order, each line prefixed
   with a colored per-process tag; single panes show one program in isolation.
 - **Scrollback**: ~10,000 lines per process, ANSI colors preserved.
