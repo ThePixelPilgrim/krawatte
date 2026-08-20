@@ -6,13 +6,15 @@
 
 #![allow(dead_code)] // wired in by a later task
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::config::{ConfigError, Krawattefile, ProcSpec, Watch};
-use crate::types::ProcId;
+use crate::types::{Changed, ProcId};
 
 /// Patterns every slot ignores. Editor temp files, VCS and build trees: the
 /// things that change constantly and never mean "restart me". Directory
@@ -160,6 +162,80 @@ fn self_target(spec: &ProcSpec) -> Result<PathBuf, String> {
             "proc {:?}: watch = \"self\" needs a path as the command's first token (got {first:?}); \"self\" cannot watch a program found through $PATH",
             spec.name
         ))
+    }
+}
+
+/// How many changed paths a marker names; the rest are counted.
+pub const SHOWN_PATHS: usize = 3;
+
+/// Per-slot pending change.
+#[derive(Debug)]
+struct Pending {
+    paths: Vec<PathBuf>,
+    more: usize,
+    last: Instant,
+}
+
+/// Quiet-period debounce: a slot's restart fires once `quiet` has passed
+/// with no further event for it. Driven by an explicit clock so it can be
+/// tested without sleeping, like the shutdown machine.
+#[derive(Debug)]
+pub struct Debouncer {
+    quiet: Duration,
+    pending: BTreeMap<ProcId, Pending>,
+}
+
+impl Debouncer {
+    pub fn new(quiet: Duration) -> Debouncer {
+        Debouncer {
+            quiet,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    /// Record a change at `path` (project-relative) for `proc` at time `now`.
+    pub fn observe(&mut self, proc: ProcId, path: PathBuf, now: Instant) {
+        let p = self.pending.entry(proc).or_insert_with(|| Pending {
+            paths: Vec::new(),
+            more: 0,
+            last: now,
+        });
+        p.last = now;
+        if p.paths.contains(&path) {
+            return;
+        }
+        if p.paths.len() < SHOWN_PATHS {
+            p.paths.push(path);
+        } else {
+            p.more += 1;
+        }
+    }
+
+    /// When the earliest pending slot would fire if nothing else happens.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.pending.values().map(|p| p.last + self.quiet).min()
+    }
+
+    /// Every slot whose quiet period has elapsed by `now`, in slot order;
+    /// they are removed from the pending set.
+    pub fn due(&mut self, now: Instant) -> Vec<Changed> {
+        let ready: Vec<ProcId> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| now.saturating_duration_since(p.last) >= self.quiet)
+            .map(|(&proc, _)| proc)
+            .collect();
+        ready
+            .into_iter()
+            .map(|proc| {
+                let p = self.pending.remove(&proc).expect("listed as ready");
+                Changed {
+                    proc,
+                    paths: p.paths,
+                    more: p.more,
+                }
+            })
+            .collect()
     }
 }
 
@@ -376,5 +452,72 @@ mod tests {
         assert!(slot.matches(&root.join("target/debug/app")));
         assert!(!slot.matches(&root.join("target/debug/app.d")));
         assert!(!slot.matches(&root.join("target/debug/deps/app")));
+    }
+
+    fn t0() -> Instant {
+        Instant::now()
+    }
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn fires_once_the_slot_has_been_quiet() {
+        let start = t0();
+        let mut d = Debouncer::new(ms(100));
+        assert_eq!(d.next_deadline(), None);
+        d.observe(0, "a.rs".into(), start);
+        assert_eq!(d.next_deadline(), Some(start + ms(100)));
+        assert!(d.due(start + ms(99)).is_empty());
+        assert_eq!(
+            d.due(start + ms(100)),
+            vec![Changed {
+                proc: 0,
+                paths: vec!["a.rs".into()],
+                more: 0
+            }]
+        );
+        assert!(d.due(start + ms(1000)).is_empty(), "fires once");
+        assert_eq!(d.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_burst_extends_the_quiet_period_and_coalesces_paths() {
+        let start = t0();
+        let mut d = Debouncer::new(ms(100));
+        d.observe(0, "a".into(), start);
+        d.observe(0, "b".into(), start + ms(50));
+        d.observe(0, "a".into(), start + ms(80)); // duplicate, not counted again
+        d.observe(0, "c".into(), start + ms(120));
+        d.observe(0, "d".into(), start + ms(130));
+        d.observe(0, "e".into(), start + ms(140));
+        assert!(
+            d.due(start + ms(200)).is_empty(),
+            "still within 100ms of the last event"
+        );
+        assert_eq!(
+            d.due(start + ms(240)),
+            vec![Changed {
+                proc: 0,
+                paths: vec!["a".into(), "b".into(), "c".into()],
+                more: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn slots_are_independent_and_returned_in_slot_order() {
+        let start = t0();
+        let mut d = Debouncer::new(ms(100));
+        d.observe(2, "x".into(), start);
+        d.observe(1, "y".into(), start + ms(50));
+        assert_eq!(d.next_deadline(), Some(start + ms(100)));
+        let first = d.due(start + ms(100));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].proc, 2);
+        assert_eq!(d.next_deadline(), Some(start + ms(150)));
+        d.observe(0, "z".into(), start + ms(50));
+        let rest = d.due(start + ms(150));
+        assert_eq!(rest.iter().map(|c| c.proc).collect::<Vec<_>>(), vec![0, 1]);
     }
 }
