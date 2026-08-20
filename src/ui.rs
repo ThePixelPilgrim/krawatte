@@ -238,6 +238,12 @@ pub struct UiState {
     /// per frame; it carries the full zone definition, so DST transitions during
     /// a long session are still handled correctly.
     tz: TimeZone,
+    /// Slots currently running a one-shot override command (`run`); shown
+    /// with a `*` after the name in the status bar.
+    overrides: Vec<bool>,
+    /// Control-socket state: `None` while no socket has been attempted,
+    /// `Some(true)` when listening, `Some(false)` when the bind failed.
+    control: Option<bool>,
 }
 
 impl UiState {
@@ -261,7 +267,27 @@ impl UiState {
             // Falls back to UTC if the system zone cannot be determined; never
             // fails.
             tz: TimeZone::system(),
+            overrides: vec![false; proc_count],
+            control: None,
         }
+    }
+
+    /// Mark or clear the override flag for a slot; out-of-range is a no-op.
+    pub fn set_override(&mut self, proc: ProcId, on: bool) {
+        if let Some(slot) = self.overrides.get_mut(proc) {
+            *slot = on;
+        }
+    }
+
+    #[allow(dead_code)] // test-only accessor
+    pub fn override_marked(&self, proc: ProcId) -> bool {
+        self.overrides.get(proc).copied().unwrap_or(false)
+    }
+
+    /// Record the control-socket state for the status bar.
+    #[allow(dead_code)] // set by the listener lifecycle, a later task
+    pub fn set_control(&mut self, control: Option<bool>) {
+        self.control = control;
     }
 
     /// Current timestamp display mode.
@@ -474,10 +500,12 @@ impl UiState {
         spans.push(Span::styled(format!("[{}]", p + 1), idx_style));
         spans.push(Span::raw(" "));
         if let Some(name) = self.names.get(p) {
-            spans.push(Span::styled(
-                name.clone(),
-                Style::default().fg(proc_color(p)),
-            ));
+            let text = if self.overrides.get(p).copied().unwrap_or(false) {
+                format!("{name}*")
+            } else {
+                name.clone()
+            };
+            spans.push(Span::styled(text, Style::default().fg(proc_color(p))));
             spans.push(Span::raw(" "));
         }
         if self.watched.get(p).copied().unwrap_or(false) {
@@ -491,6 +519,34 @@ impl UiState {
         spans
     }
 
+    /// The right-hand markers of the status bar: FOLLOW/SCROLL, WRAP, and the
+    /// control-socket state.
+    pub fn status_markers(&self) -> Vec<Span<'static>> {
+        let mut spans = vec![if self.following() {
+            Span::styled(" FOLLOW", Style::default().fg(Color::Green))
+        } else {
+            Span::styled(" SCROLL", Style::default().fg(Color::Yellow))
+        }];
+        // Dim, so WRAP and CTRL read as mode annotations next to FOLLOW/SCROLL
+        // rather than competing with them, and so the modes are discoverable
+        // without pressing a key. A failed bind is red: it is a problem.
+        if self.wrap {
+            spans.push(Span::styled(
+                " WRAP",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        match self.control {
+            Some(true) => spans.push(Span::styled(
+                " CTRL",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+            Some(false) => spans.push(Span::styled(" NO CTRL", Style::default().fg(Color::Red))),
+            None => {}
+        }
+        spans
+    }
+
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for p in 0..self.proc_count {
@@ -499,21 +555,7 @@ impl UiState {
             }
             spans.extend(self.slot_label(p));
         }
-        let follow_marker = if self.following() {
-            Span::styled(" FOLLOW", Style::default().fg(Color::Green))
-        } else {
-            Span::styled(" SCROLL", Style::default().fg(Color::Yellow))
-        };
-        spans.push(follow_marker);
-        // Dim, so it reads as a mode annotation next to FOLLOW/SCROLL rather
-        // than competing with them, and so the mode is discoverable without
-        // pressing a key.
-        if self.wrap {
-            spans.push(Span::styled(
-                " WRAP",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
+        spans.extend(self.status_markers());
         let bar = Paragraph::new(TuiLine::from(spans))
             .style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_widget(bar, area);
@@ -1465,5 +1507,21 @@ mod tests {
         assert_eq!(plain(&second), "[2] p1 ●");
         let w = first.spans.iter().find(|sp| sp.content == "w").unwrap();
         assert!(w.style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn override_slots_show_a_star_and_control_state_is_marked() {
+        let mut s = ui(2);
+        s.set_override(1, true);
+        assert_eq!(plain(&TuiLine::from(s.slot_label(1))), "[2] p1* ●");
+        assert_eq!(plain(&TuiLine::from(s.slot_label(0))), "[1] p0 ●");
+
+        assert_eq!(plain(&TuiLine::from(s.status_markers())), " FOLLOW");
+        s.set_control(Some(true));
+        assert_eq!(plain(&TuiLine::from(s.status_markers())), " FOLLOW CTRL");
+        s.set_control(Some(false));
+        let markers = TuiLine::from(s.status_markers());
+        assert_eq!(plain(&markers), " FOLLOW NO CTRL");
+        assert_eq!(markers.spans.last().unwrap().style.fg, Some(Color::Red));
     }
 }

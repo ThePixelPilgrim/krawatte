@@ -29,7 +29,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::buffer::{BufferSet, StyledLine};
 use crate::config::ProcSpec;
-use crate::proc::{Outcome, ProcManager, Transition};
+use crate::proc::{GenKind, Outcome, ProcManager, Transition};
 use crate::types::{Config, Event, ExitStatus, Health, Trigger};
 use crate::ui::{Action, UiState};
 use crate::watch::SlotWatch;
@@ -316,7 +316,16 @@ fn drain_events(
                 status,
             } => {
                 if manager.is_current(proc, r#gen) && !manager.is_restarting(proc) {
-                    ui.set_health(proc, health_from_exit(status));
+                    if manager.is_override(proc) {
+                        // The one-shot command is done; the standard one resumes.
+                        let standard = manager.standard_command(proc).to_string();
+                        if manager.replace_with(proc, standard, GenKind::Standard, Trigger::Resume)
+                        {
+                            ui.set_health(proc, Health::Restarting);
+                        }
+                    } else {
+                        ui.set_health(proc, health_from_exit(status));
+                    }
                 }
             }
             Event::SpawnFailed { proc, r#gen, .. } => {
@@ -328,6 +337,10 @@ fn drain_events(
                 // Mid-restart the new generation has not spawned yet and will
                 // read the disk as it is then, so a further change adds nothing.
                 if manager.is_restarting(changed.proc) {
+                    continue;
+                }
+                // Overrides are pinned: a watch never replaces a `run` command.
+                if manager.is_override(changed.proc) {
                     continue;
                 }
                 let standard = manager.standard_command(changed.proc).to_string();
@@ -374,6 +387,7 @@ fn apply_transition(
         (None, None) => Health::SpawnFailed,
     };
     ui.set_health(t.proc, health);
+    ui.set_override(t.proc, manager.is_override(t.proc));
 }
 
 /// Map a terminal exit status to a [`Health`] for the status bar.
@@ -418,6 +432,17 @@ mod tests {
 
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("krawatte").chain(args.iter().copied())).unwrap()
+    }
+
+    fn tick_until(manager: &mut ProcManager, limit: Duration) -> Transition {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if let Some(t) = manager.tick().pop() {
+                return t;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no transition within {limit:?}");
     }
 
     #[test]
@@ -543,13 +568,7 @@ mod tests {
         // In flight: a second change is dropped, not queued.
         tx.send(changed()).unwrap();
         drain_events(&rx, &mut buffers, &mut ui, &mut manager);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut transitions = Vec::new();
-        while transitions.is_empty() && Instant::now() < deadline {
-            transitions = manager.tick();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let t = transitions.pop().expect("one restart");
+        let t = tick_until(&mut manager, Duration::from_secs(5));
         assert_eq!(
             t.trigger,
             Trigger::Watch {
@@ -618,14 +637,7 @@ mod tests {
         assert_eq!(ui.health(0), Health::Restarting);
 
         // Drive the restart to completion.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut transitions = Vec::new();
-        while transitions.is_empty() && Instant::now() < deadline {
-            drain_events(&rx, &mut buffers, &mut ui, &mut manager);
-            transitions = manager.tick();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let t = transitions.pop().expect("restart completed");
+        let t = tick_until(&mut manager, Duration::from_secs(5));
         apply_transition(&t, &manager, &mut buffers, &mut ui);
         assert_eq!(ui.health(0), Health::Running);
         // The four-line marker block followed the one real line.
@@ -645,6 +657,78 @@ mod tests {
         assert_eq!(buffers.buffer(0).len(), 6);
         assert_eq!(ui.health(0), Health::Running);
 
+        manager.shutdown();
+    }
+
+    #[test]
+    fn an_override_that_exits_resumes_the_standard_command() {
+        let (tx, rx) = mpsc::channel();
+        let config = Config {
+            grace_period: Duration::from_millis(200),
+            ..Config::default()
+        };
+        let mut manager = ProcManager::spawn_all(&["sleep 30".to_string()], &config, tx.clone());
+        let mut buffers = BufferSet::new(1, &config);
+        let mut ui = UiState::new(vec!["sleep".to_string()]);
+
+        assert!(manager.replace_with(
+            0,
+            "true".to_string(),
+            GenKind::Override,
+            Trigger::Cli("run".into())
+        ));
+        let t = tick_until(&mut manager, Duration::from_secs(5));
+        apply_transition(&t, &manager, &mut buffers, &mut ui);
+        assert!(ui.override_marked(0));
+
+        // Wait for `true` to exit, then let the main loop see it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !manager.is_dead(0) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
+        assert!(
+            manager.is_restarting(0),
+            "self-exit of an override starts the resume"
+        );
+        let t = tick_until(&mut manager, Duration::from_secs(5));
+        assert_eq!(t.trigger, Trigger::Resume);
+        assert_eq!(t.new.as_ref().unwrap().command, "sleep 30");
+        apply_transition(&t, &manager, &mut buffers, &mut ui);
+        assert!(!manager.is_override(0));
+        assert!(!ui.override_marked(0));
+        assert_eq!(ui.health(0), Health::Running);
+        manager.shutdown();
+    }
+
+    #[test]
+    fn a_change_does_not_touch_a_running_override() {
+        let (tx, rx) = mpsc::channel();
+        let config = Config {
+            grace_period: Duration::from_millis(200),
+            ..Config::default()
+        };
+        let mut manager = ProcManager::spawn_all(&["sleep 30".to_string()], &config, tx.clone());
+        let mut buffers = BufferSet::new(1, &config);
+        let mut ui = UiState::new(vec!["sleep".to_string()]);
+        assert!(manager.replace_with(
+            0,
+            "sleep 31".to_string(),
+            GenKind::Override,
+            Trigger::Cli("run".into())
+        ));
+        tick_until(&mut manager, Duration::from_secs(5));
+
+        tx.send(Event::Changed(Changed {
+            proc: 0,
+            paths: vec!["a".into()],
+            more: 0,
+        }))
+        .unwrap();
+        drain_events(&rx, &mut buffers, &mut ui, &mut manager);
+        assert!(!manager.is_restarting(0));
+        assert_eq!(manager.current_command(0), "sleep 31");
         manager.shutdown();
     }
 

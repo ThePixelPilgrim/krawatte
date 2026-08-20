@@ -132,6 +132,5 @@ pub enum Trigger {
     #[allow(dead_code)] // constructed by the control handler, a later task
     Cli(String),
     /// An override exited on its own; the standard command resumes.
-    #[allow(dead_code)] // constructed by the main loop's resume rule, a later task
     Resume,
 }

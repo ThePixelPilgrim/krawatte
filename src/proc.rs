@@ -473,7 +473,6 @@ impl ProcManager {
 
     /// Whether the slot currently runs an override rather than its standard
     /// command.
-    #[allow(dead_code)] // read by the control handler, a later task
     pub fn is_override(&self, proc: ProcId) -> bool {
         self.procs
             .get(proc)
