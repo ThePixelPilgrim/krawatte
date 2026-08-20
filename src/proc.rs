@@ -24,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, setpgid};
 
+use crate::config::short_name_of;
 use crate::types::{Config, Event, ExitStatus, Gen, ProcId, Seq, StreamTag};
 
 /// One spawn of a slot's command. A slot holds at most one generation that may
@@ -584,18 +585,6 @@ fn exit_status_from(es: &std::process::ExitStatus) -> ExitStatus {
     }
 }
 
-/// Derive a short status-bar name from a command line: the basename of the first
-/// whitespace-separated token.
-fn short_name_of(command: &str) -> String {
-    let first = command.split_whitespace().next().unwrap_or("");
-    let base = first.rsplit('/').next().unwrap_or(first);
-    if base.is_empty() {
-        command.to_string()
-    } else {
-        base.to_string()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Shutdown state machine (pure sequencing, testable against a stub)
 // ---------------------------------------------------------------------------
@@ -953,14 +942,6 @@ mod tests {
             "SIGKILL should still have been tried"
         );
         assert_eq!(m.abandoned(), vec![0]);
-    }
-
-    #[test]
-    fn short_name_takes_basename_of_first_token() {
-        assert_eq!(short_name_of("cargo watch -x check"), "cargo");
-        assert_eq!(short_name_of("/usr/bin/python worker.py"), "python");
-        assert_eq!(short_name_of("npm run dev"), "npm");
-        assert_eq!(short_name_of(""), "");
     }
 
     #[test]

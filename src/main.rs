@@ -6,6 +6,7 @@
 //! (and kills children) even on panic.
 
 mod buffer;
+mod config;
 mod marker;
 mod proc;
 mod types;
