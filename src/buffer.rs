@@ -13,17 +13,25 @@ use std::time::SystemTime;
 use ansi_to_tui::IntoText;
 use ratatui::text::Line as TuiLine;
 
-use crate::types::{Config, ProcId, Seq, StreamTag};
+use crate::types::{Config, Gen, ProcId, Seq, StreamTag};
 
 /// A single stored line: its provenance plus the pre-parsed styled content.
 #[derive(Debug, Clone)]
 pub struct StyledLine {
     pub proc: ProcId,
+    /// Generation of the slot that produced the line; markers carry the
+    /// generation current when they were inserted.
+    #[allow(dead_code)] // read by the control handler, a later task
+    pub r#gen: Gen,
     pub stream: StreamTag,
     pub seq: Seq,
     /// Wall-clock arrival time, stamped by the reader thread. Display-only:
     /// ordering is governed by `seq` alone.
     pub at: SystemTime,
+    /// The bytes as written (ANSI escapes intact), so a client asking for
+    /// color gets exactly what the process emitted.
+    #[allow(dead_code)] // read by the control handler, a later task
+    pub raw: Vec<u8>,
     /// ANSI-parsed styled content, owned (`'static`).
     pub content: TuiLine<'static>,
 }
@@ -34,6 +42,7 @@ impl StyledLine {
     /// is handled lossily.
     pub fn parse(
         proc: ProcId,
+        r#gen: Gen,
         stream: StreamTag,
         seq: Seq,
         at: SystemTime,
@@ -42,9 +51,11 @@ impl StyledLine {
         let content = parse_line(bytes);
         StyledLine {
             proc,
+            r#gen,
             stream,
             seq,
             at,
+            raw: bytes.to_vec(),
             content,
         }
     }
@@ -52,14 +63,26 @@ impl StyledLine {
     /// A line krawatte inserts itself (a restart marker): plain text, no ANSI
     /// parsing, tagged [`StreamTag::Marker`] so the UI renders it as a note
     /// rather than as process output.
-    pub fn marker(proc: ProcId, seq: Seq, at: SystemTime, text: String) -> StyledLine {
+    pub fn marker(proc: ProcId, r#gen: Gen, seq: Seq, at: SystemTime, text: String) -> StyledLine {
         StyledLine {
             proc,
+            r#gen,
             stream: StreamTag::Marker,
             seq,
             at,
+            raw: text.clone().into_bytes(),
             content: TuiLine::from(text),
         }
+    }
+
+    /// The text without styling: the concatenated span contents.
+    #[allow(dead_code)] // read by the control handler, a later task
+    pub fn plain(&self) -> String {
+        self.content
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
     }
 }
 
@@ -229,6 +252,7 @@ mod tests {
     fn line(proc: ProcId, seq: Seq, text: &str) -> StyledLine {
         StyledLine::parse(
             proc,
+            0,
             StreamTag::Stdout,
             seq,
             SystemTime::UNIX_EPOCH,
@@ -288,7 +312,7 @@ mod tests {
     fn ansi_color_parses_to_styled_spans() {
         // Red "err" then reset.
         let raw = b"\x1b[31merr\x1b[0m done";
-        let sl = StyledLine::parse(0, StreamTag::Stderr, 0, SystemTime::UNIX_EPOCH, raw);
+        let sl = StyledLine::parse(0, 0, StreamTag::Stderr, 0, SystemTime::UNIX_EPOCH, raw);
         // Reconstructed text drops escape codes.
         let text: String = sl
             .content
@@ -309,7 +333,7 @@ mod tests {
     #[test]
     fn invalid_utf8_is_lossy_not_panic() {
         let raw = &[0xff, 0xfe, b'h', b'i'];
-        let sl = StyledLine::parse(0, StreamTag::Stdout, 0, SystemTime::UNIX_EPOCH, raw);
+        let sl = StyledLine::parse(0, 0, StreamTag::Stdout, 0, SystemTime::UNIX_EPOCH, raw);
         let text: String = sl
             .content
             .spans
@@ -366,7 +390,7 @@ mod tests {
 
     #[test]
     fn marker_line_is_plain_text_tagged_as_marker() {
-        let sl = StyledLine::marker(2, 7, SystemTime::UNIX_EPOCH, "── restart ──".to_string());
+        let sl = StyledLine::marker(2, 0, 7, SystemTime::UNIX_EPOCH, "── restart ──".to_string());
         assert_eq!(sl.proc, 2);
         assert_eq!(sl.seq, 7);
         assert_eq!(sl.stream, StreamTag::Marker);
@@ -377,5 +401,17 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(text, "── restart ──");
+    }
+
+    #[test]
+    fn parse_keeps_raw_bytes_and_generation_and_yields_plain_text() {
+        let raw = b"\x1b[31mred\x1b[0m text";
+        let sl = StyledLine::parse(1, 4, StreamTag::Stdout, 9, SystemTime::UNIX_EPOCH, raw);
+        assert_eq!(sl.r#gen, 4);
+        assert_eq!(sl.raw, raw.to_vec());
+        assert_eq!(sl.plain(), "red text");
+        let m = StyledLine::marker(1, 4, 10, SystemTime::UNIX_EPOCH, "── x ──".to_string());
+        assert_eq!(m.raw, "── x ──".as_bytes());
+        assert_eq!(m.plain(), "── x ──");
     }
 }

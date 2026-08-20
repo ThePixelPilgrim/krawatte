@@ -307,7 +307,7 @@ fn drain_events(
                 bytes,
             } => {
                 if manager.is_current(proc, r#gen) {
-                    buffers.push(StyledLine::parse(proc, stream, seq, at, &bytes));
+                    buffers.push(StyledLine::parse(proc, r#gen, stream, seq, at, &bytes));
                 }
             }
             Event::Exited {
@@ -352,7 +352,13 @@ fn apply_transition(
 ) {
     let at = SystemTime::now();
     for text in marker::restart_block(t, &ui.clock(at)) {
-        buffers.push(StyledLine::marker(t.proc, manager.next_seq(), at, text));
+        buffers.push(StyledLine::marker(
+            t.proc,
+            manager.current_gen(t.proc),
+            manager.next_seq(),
+            at,
+            text,
+        ));
     }
     let health = match t.new.spawn {
         Ok(_) => Health::Running,

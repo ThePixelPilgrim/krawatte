@@ -1112,7 +1112,7 @@ mod tests {
     #[test]
     fn tagged_line_prepends_the_stamp_before_the_tag() {
         let now = at(1_785_931_387);
-        let sl = StyledLine::parse(0, crate::types::StreamTag::Stdout, 0, now, b"hello");
+        let sl = StyledLine::parse(0, 0, crate::types::StreamTag::Stdout, 0, now, b"hello");
 
         let (plain, _) = tagged_line(&sl, true, TimeDisplay::Off, now, &fixed_tz());
         let text: String = plain.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     fn marker_lines_render_dim_without_the_stderr_marker() {
         let now = at(0);
-        let sl = StyledLine::marker(0, 0, now, "── restart ──".to_string());
+        let sl = StyledLine::marker(0, 0, 0, now, "── restart ──".to_string());
         let (line, prefix) = tagged_line(&sl, true, TimeDisplay::Off, now, &fixed_tz());
         // All-view keeps the process tag so the reader knows which slot it was.
         assert_eq!(plain(&line), "1│ ── restart ──");
