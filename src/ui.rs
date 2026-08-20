@@ -524,6 +524,7 @@ impl UiState {
 fn health_glyph(health: Health) -> (String, Style) {
     match health {
         Health::Running => ("●".to_string(), Style::default().fg(Color::Green)),
+        Health::Restarting => ("↻".to_string(), Style::default().fg(Color::Yellow)),
         Health::ExitedOk => ("✔ exit 0".to_string(), Style::default().fg(Color::DarkGray)),
         Health::ExitedErr(status) => {
             let detail = match status {

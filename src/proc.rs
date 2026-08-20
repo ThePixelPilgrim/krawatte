@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, setpgid};
 
-use crate::types::{Config, Event, ExitStatus, ProcId, Seq, StreamTag};
+use crate::types::{Config, Event, ExitStatus, Gen, ProcId, Seq, StreamTag};
 
 /// Per-child state retained by the manager after spawning.
 struct Proc {
@@ -88,7 +88,7 @@ impl ProcManager {
 
         for (proc, command) in commands.iter().enumerate() {
             let short = short_name_of(command);
-            match spawn_one(proc, shell, command, &seq, &tx) {
+            match spawn_one(proc, 0, shell, command, &seq, &tx) {
                 Ok((pgid, dead, status, waiter)) => procs.push(Proc {
                     command: command.clone(),
                     short,
@@ -102,6 +102,7 @@ impl ProcManager {
                     // Spawn failure: report it and record an immediately-dead slot.
                     let _ = tx.send(Event::SpawnFailed {
                         proc,
+                        r#gen: 0,
                         error: err.to_string(),
                     });
                     procs.push(Proc {
@@ -224,6 +225,7 @@ type SpawnParts = (
 
 fn spawn_one(
     proc: ProcId,
+    r#gen: Gen,
     shell: &str,
     command: &str,
     seq: &Arc<AtomicU64>,
@@ -254,8 +256,22 @@ fn spawn_one(
     let stderr = child.stderr.take().expect("stderr piped");
 
     // Detached on purpose -- see the `waiter` field on `Proc`.
-    spawn_reader(proc, StreamTag::Stdout, stdout, seq.clone(), tx.clone());
-    spawn_reader(proc, StreamTag::Stderr, stderr, seq.clone(), tx.clone());
+    spawn_reader(
+        proc,
+        r#gen,
+        StreamTag::Stdout,
+        stdout,
+        seq.clone(),
+        tx.clone(),
+    );
+    spawn_reader(
+        proc,
+        r#gen,
+        StreamTag::Stderr,
+        stderr,
+        seq.clone(),
+        tx.clone(),
+    );
 
     let dead = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new(None));
@@ -271,7 +287,11 @@ fn spawn_one(
         };
         *waiter_status.lock().unwrap() = Some(st);
         waiter_dead.store(true, Ordering::SeqCst);
-        let _ = waiter_tx.send(Event::Exited { proc, status: st });
+        let _ = waiter_tx.send(Event::Exited {
+            proc,
+            r#gen,
+            status: st,
+        });
     });
 
     Ok((pgid, dead, status, waiter))
@@ -282,6 +302,7 @@ fn spawn_one(
 /// it ends only at pipe EOF, which krawatte cannot force.
 fn spawn_reader(
     proc: ProcId,
+    r#gen: Gen,
     stream: StreamTag,
     src: impl Read + Send + 'static,
     seq: Arc<AtomicU64>,
@@ -296,13 +317,13 @@ fn spawn_reader(
                 Ok(0) => {
                     // EOF: flush any trailing partial line.
                     if !buf.is_empty() {
-                        emit(proc, stream, &seq, &tx, &mut buf);
+                        emit(proc, r#gen, stream, &seq, &tx, &mut buf);
                     }
                     break;
                 }
                 Ok(_) => {
                     if byte[0] == b'\n' {
-                        emit(proc, stream, &seq, &tx, &mut buf);
+                        emit(proc, r#gen, stream, &seq, &tx, &mut buf);
                     } else {
                         buf.push(byte[0]);
                     }
@@ -322,6 +343,7 @@ fn spawn_reader(
 /// [`Seq`].
 fn emit(
     proc: ProcId,
+    r#gen: Gen,
     stream: StreamTag,
     seq: &Arc<AtomicU64>,
     tx: &Sender<Event>,
@@ -335,6 +357,7 @@ fn emit(
     let bytes = std::mem::take(buf);
     let _ = tx.send(Event::Line {
         proc,
+        r#gen,
         stream,
         seq: s,
         at,
@@ -880,13 +903,20 @@ mod tests {
         assert_eq!(statuses[0], Some(ExitStatus::Code(0)));
         let mut seqs: Vec<Seq> = Vec::new();
         let mut lines: Vec<Vec<u8>> = Vec::new();
+        let mut gens: Vec<Gen> = Vec::new();
         for e in rx.try_iter() {
-            if let Event::Line { seq, bytes, .. } = e {
+            if let Event::Line {
+                seq, bytes, r#gen, ..
+            } = e
+            {
                 seqs.push(seq);
                 lines.push(bytes);
+                gens.push(r#gen);
             }
         }
         assert_eq!(lines, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
         assert!(seqs.windows(2).all(|w| w[0] < w[1]));
+        // The initial spawn is generation 0; restarts count up from there.
+        assert!(gens.iter().all(|&g| g == 0));
     }
 }

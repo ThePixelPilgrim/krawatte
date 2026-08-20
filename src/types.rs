@@ -16,11 +16,20 @@ pub type ProcId = usize;
 /// order when interleaving buffers in the all-view.
 pub type Seq = u64;
 
+/// Generation counter of a slot: `0` for the initial spawn, incremented every
+/// time the slot is respawned. Events carry the generation they came from so
+/// the UI can drop output from a generation that has since been replaced.
+pub type Gen = u32;
+
 /// Which of a child's two pipes a line came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamTag {
     Stdout,
     Stderr,
+    /// A line krawatte inserted into a slot's buffer itself (a restart marker),
+    /// not process output. Rendered dim, without the stderr marker.
+    #[allow(dead_code)]
+    Marker,
 }
 
 /// The exit outcome of a child process.
@@ -37,6 +46,9 @@ pub enum ExitStatus {
 pub enum Health {
     /// Process is alive and running.
     Running,
+    /// The current generation is being torn down ahead of a respawn.
+    #[allow(dead_code)]
+    Restarting,
     /// Process exited cleanly (`exit 0`).
     ExitedOk,
     /// Process exited with a non-zero code or was signalled.
@@ -56,16 +68,25 @@ pub enum Event {
     /// buffer).
     Line {
         proc: ProcId,
+        #[allow(dead_code)]
+        r#gen: Gen,
         stream: StreamTag,
         seq: Seq,
         at: SystemTime,
         bytes: Vec<u8>,
     },
     /// A child process exited and was reaped.
-    Exited { proc: ProcId, status: ExitStatus },
+    Exited {
+        proc: ProcId,
+        #[allow(dead_code)]
+        r#gen: Gen,
+        status: ExitStatus,
+    },
     /// A command failed to spawn.
     SpawnFailed {
         proc: ProcId,
+        #[allow(dead_code)]
+        r#gen: Gen,
         #[allow(dead_code)]
         error: String,
     },

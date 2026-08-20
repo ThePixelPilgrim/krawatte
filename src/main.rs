@@ -162,6 +162,7 @@ fn drain_events(
         match ev {
             Event::Line {
                 proc,
+                r#gen: _,
                 stream,
                 seq,
                 at,
@@ -171,7 +172,7 @@ fn drain_events(
                     buffers.push(StyledLine::parse(proc, stream, seq, at, &bytes));
                 }
             }
-            Event::Exited { proc, status } => {
+            Event::Exited { proc, status, .. } => {
                 ui.set_health(proc, health_from_exit(status));
             }
             Event::SpawnFailed { proc, .. } => {
