@@ -69,7 +69,7 @@ cwd   = "frontend"
 | `proc.cmd` | yes | run via `sh -c`, as today |
 | `proc.cwd` | no | working directory, relative to the project dir (absolute allowed); must exist at load |
 | `proc.env` | no | table of string → string, set on top of the inherited environment |
-| `proc.watch` | no | string or array of strings; parsed and stored here, interpreted in spec D |
+| `proc.watch` | no | the bare string `"self"`, or an array of path strings (a path literally named `self` goes in the array); any other bare string is an error; interpreted in spec D |
 | `proc.ignore` | no | array of glob strings; stored here, interpreted in spec D |
 
 Unknown keys anywhere are errors (`deny_unknown_fields`), so a typo like
@@ -111,8 +111,8 @@ pub struct ProcSpec {
     /// Absolute, already resolved against the project dir. `None` = inherit.
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
-    /// Raw `watch` entries, as written. Spec D resolves them.
-    pub watch: Vec<String>,
+    /// As written: the `self` keyword, or path entries. Spec D resolves them.
+    pub watch: Watch,            // enum Watch { None, SelfBinary, Paths(Vec<String>) }
     pub ignore: Vec<String>,
 }
 
@@ -162,7 +162,8 @@ is not worth it.
 
 - `config::parse` against inline strings: the example above; missing `name`;
   missing `cmd`; duplicate name; invalid name (`"my proc"`, `"12"`, `"all"`);
-  unknown key at top level and inside a proc; `watch` as string and as array;
+  unknown key at top level and inside a proc; `watch = "self"`, `watch = ["self", "src"]`,
+  and bare `watch = "src"` rejected;
   `env` with a non-string value; nonexistent `cwd` (tempdir); several errors
   in one file all reported; empty file → "no [[proc]]".
 - `config::discover` with a tempdir tree: found from a grandchild dir; not

@@ -21,13 +21,23 @@ Same primitive as `r`, different trigger.
 
 ### What is watched
 
-`watch` is a string or array of strings per slot. Each entry is one of:
+`watch` is either the bare string `"self"` or an array of paths:
+
+| Form | Meaning |
+|---|---|
+| `watch = "self"` | the file named by the first whitespace-separated token of `cmd` |
+| `watch = ["…", …]` | each entry is a path (see below); `"self"` inside the array is a path like any other |
+| `watch = "src"` (any other bare string) | error: use the array form — the bare-string form is reserved for the keyword, so the keyword can never shadow a file |
+
+The disambiguation is the form, not the spelling: a project that really has
+a file or directory called `self` watches it with `watch = ["self"]`.
+
+Each array entry is one of:
 
 | Entry | Meaning |
 |---|---|
 | a directory | watched recursively |
 | a file | its parent directory is watched, events filtered to that file name — so a tool that writes a temp file and renames it into place (cargo, most editors) is still seen, and the file is always complete when it is |
-| `"self"` | the file named by the first whitespace-separated token of `cmd` |
 
 Relative entries and the `self` token resolve against the slot's effective
 cwd (`cwd` if set, else the project dir) — the same base the command itself
@@ -178,7 +188,8 @@ reader threads: nothing waits on it, and it ends with the process.
 
 - `resolve`: dir, file, `self` with and without `/`, relative to cwd vs
   project dir, missing dir error, missing file with present parent accepted,
-  missing parent error.
+  missing parent error; bare `watch = "src"` rejected; `watch = ["self"]`
+  resolves to a path named `self`, not to the command.
 - `Debouncer` with a virtual clock: one event fires after `quiet`; a burst
   fires once with all paths (and `more` counting beyond three); two slots
   fire independently; `next_deadline` is the earliest pending.
@@ -207,6 +218,7 @@ crash-restart policy.
 - A change during an in-flight restart is dropped, not queued.
 - Built-in ignore list is fixed; per-slot `ignore` only adds to it.
 - `self` requires a path-like first token; `"self"` on `npm …` is an error.
+- Bare string is only ever the `self` keyword; all paths go in an array.
 - A missing watched *file* is allowed at launch (parent must exist).
 - Status bar marks watched slots with a dim `w`.
 - `notify` + `globset` as dependencies; debounce hand-rolled so it is
