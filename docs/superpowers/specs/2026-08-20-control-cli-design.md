@@ -23,21 +23,38 @@ request.
 ### CLI
 
 ```
-krawatte status            [--json]
-krawatte restart <SLOT>    [--wait] [--json]
-krawatte kill    <SLOT>    [--wait] [--json]
-krawatte run     <SLOT>    [--wait] [--json] (-- <CMD>... | --wrap <PREFIX>)
-krawatte logs    [SLOT]    [--tail N] [--since DUR] [--color] [--json]
+krawatte status                 [--json]
+krawatte restart <SLOT|all>     [--wait] [--json]   # tear down, respawn the current command
+krawatte kill    <SLOT|all>     [--wait] [--json]   # tear down, respawn the standard command
+krawatte stop    <SLOT|all>     [--wait] [--json]   # tear down, leave dead
+krawatte start   <SLOT|all>     [--wait] [--json]   # spawn standard in dead slots; running slots untouched
+krawatte run     <SLOT>         [--wait] [--json] (-- <CMD>... | --wrap <PREFIX>)
+krawatte quit                   [--wait] [--json]   # shut the whole instance down, exactly like q
+krawatte logs    [SLOT|all]     [--tail N] [--since DUR] [--color] [--json]
 ```
 
 - `SLOT` is a slot name (Krawattefile) or a 1-based index (works in ad-hoc
-  mode too). `logs` with no slot, or `all`, interleaves every slot in
-  arrival order with a `name│` prefix, as the all-view does.
-- `restart`/`kill`/`run` return as soon as the request is accepted (exit 0,
-  printing the slot and the generation that is being torn down). `--wait`
-  blocks until the transition completes and prints the marker block — so an
-  agent can `krawatte restart server --wait && krawatte logs server --since 10s`.
+  mode too). `all` is the reserved word for every slot — which is why spec B
+  forbids it as a proc name. `logs` with no slot, or `all`, interleaves every
+  slot in arrival order with a `name│` prefix, as the all-view does.
+- `all` applies the verb to every slot independently, teardowns started in
+  the same tick (in parallel, as `q` does), slot order. A slot with a restart
+  already in flight is skipped and listed in the reply
+  (`skipped: build (restart in flight)`); exit 0 unless every slot was
+  skipped, then exit 1. `--wait` waits for all resulting transitions.
+- `restart`/`kill`/`stop`/`start`/`run` return as soon as the request is
+  accepted (exit 0, printing the slot and the generation that is being torn
+  down). `--wait` blocks until the transition completes and prints the marker
+  block — so an agent can
+  `krawatte restart server --wait && krawatte logs server --since 10s`.
   The CLI gives up after the grace period plus ten seconds.
+- `stop` leaves the slot dead: the status bar shows how it ended
+  (`✖ sig 15`), the marker header says `stop · cli stop` so it is never
+  mistaken for a crash, and only `start`, `restart`, `r`/`k`, or a watch
+  event (spec D) bring it back. `start` on a running slot is a no-op reported
+  as `already running`; on a stopped slot it equals `restart`.
+- `quit` runs the same TERM → grace → KILL → exit path as `q`. With `--wait`
+  the CLI returns when the socket closes, i.e. when krawatte has exited.
 - `run` spawns a **one-shot override** in the slot: `-- <CMD>...` is the
   full command (joined with spaces, run via `sh -c` in the slot's cwd/env);
   `--wrap <PREFIX>` runs `<PREFIX> <standard command>`
@@ -76,7 +93,8 @@ explicit file.
 - The status bar shows `*` after an override slot's name and a dim `CTRL`
   marker at the far right while the socket is listening; `NO CTRL` if it
   could not be bound (see below).
-- Marker headers show the trigger: `cli restart`, `cli kill`, `cli run`,
+- Marker headers show the trigger: `cli restart`, `cli kill`, `cli stop`,
+  `cli start`, `cli run`,
   `resume`, alongside D's `key r`/`key k`/`watch`.
 - The override is a property of the *current generation*: `r` restarts it
   (same command, still an override); `k` and self-exit return the slot to the
@@ -105,6 +123,9 @@ explicit file.
 → {"v":1,"cmd":"restart","slot":"server","wait":true}
 ← {"ok":true,"proc":1,"name":"server","from_gen":2,"to_gen":3,"marker":["── restart · gen 2 → 3 · 14:02:11 · cli restart ──", ...]}
 
+→ {"v":1,"cmd":"restart","slot":"all","wait":false}
+← {"ok":true,"started":[{"proc":0,"name":"build","from_gen":4},{"proc":2,"name":"web","from_gen":0}],"skipped":[{"proc":1,"name":"server","reason":"restart in flight"}]}
+
 → {"v":1,"cmd":"logs","slot":null,"tail":100,"since_ms":300000,"color":false}
 ← {"ok":true,"lines":[{"seq":8812,"at_ms":1755691331000,"gen":3,"proc":1,"name":"server","stream":"stdout","text":"listening on :8080"}, ...]}
 
@@ -126,14 +147,20 @@ explicit file.
   then block on `reply.recv()` with a timeout and write the line. Threads are
   cheap here and keep the socket code free of any shared state.
 - `handle(request, &mut ProcManager, &BufferSet, &UiState) -> Handled`
-  where `Handled::Now(Response)` or `Handled::AfterTransition { proc, reply }`.
-  Pure given the manager; this is the unit-test surface.
+  where `Handled::Now(Response)`, `Handled::AfterTransitions { procs: HashSet<ProcId>, partial: Response }`
+  (the reply is completed once every listed slot has transitioned; `all` is
+  just a set with several members), or `Handled::Quit(Response)`. Pure given
+  the manager; this is the unit-test surface.
 
 ### `main.rs`
 
-- `Event::Control` → `control::handle`; `Now` replies immediately,
-  `AfterTransition` is parked in a `Vec<(ProcId, Sender<Response>)>` that
-  `apply_transition` drains for the matching slot, sending the marker block.
+- `Event::Control` → `control::handle`; `Now` replies immediately;
+  `AfterTransitions` is parked as `(HashSet<ProcId> outstanding, Sender<Response>)`
+  entries that `apply_transition` updates, appending each slot's marker
+  block; the reply is sent once its set is empty.
+- `Quit` answers first, then sets the same flag `q` does; the event loop
+  returns and the normal shutdown runs. With `wait` the CLI blocks until the
+  connection is closed by process exit.
 - Self-exit of an override: on `Event::Exited` for the current generation of
   an override slot, `replace(p, standard, Trigger::Resume)`.
 
@@ -142,6 +169,12 @@ explicit file.
 - `Proc.kind: GenKind { Standard, Override }` for the current generation;
   `replace_with(proc, command, kind, trigger)`; `replace` keeps the current
   kind, `kill` sets `Standard`. `is_override(proc)`.
+- `stop(proc, trigger)`: teardown with nothing to spawn. This generalises
+  spec A's `Restart.next: String` to `Option<String>` and
+  `Transition.new: NewGen` to `Option<NewGen>`; the marker block gains the
+  `stop · gen N` header and a `── slot stopped ──` line. Spec A deliberately
+  left this out because no hotkey needed it; the CLI is its first caller.
+- `is_dead(proc)` for `start`.
 - `status()` snapshot: per slot name, health-ish state, gen, pid, command,
   standard, kind, started-at.
 
@@ -171,10 +204,14 @@ line, render. No async runtime.
   replaced; live socket (a test listener) yields the "another instance"
   outcome.
 - `control::handle` with a real manager and buffers: `status` shape;
-  `restart` by name and by index, unknown slot, in-flight → error; `logs`
+  `restart` by name and by index, unknown slot, in-flight → error; `restart
+  all` with one slot in flight → that slot skipped, others restarted, reply
+  lists it; `stop` leaves the slot dead with a `stop` marker; `start` on a
+  stopped slot spawns, on a running slot reports `already running`; `logs`
   tail/since/all ordering and stripping; `run --wrap` builds the right
   command and marks the slot an override; `kill` on an override returns to
-  standard.
+  standard; `quit` makes the event loop return.
+- `--wait` on `all`: reply arrives only after the last transition.
 - Override self-exit: a `run` of `sh -c 'sleep 0.2'` is followed by a
   `resume` transition back to the standard command, with `kind == Standard`.
 - Watch pinning (D's rule 2): crafted `Event::Changed` for an override slot
@@ -193,8 +230,7 @@ line, render. No async runtime.
 
 `logs --follow` (streaming); starting a cluster without a TTY; multiple
 clients sharing one connection; authentication beyond filesystem
-permissions (same-uid only, which is the threat model of a dev tool);
-`krawatte stop` for the whole instance (press `q`).
+permissions (same-uid only, which is the threat model of a dev tool).
 
 ## Decisions made in this spec (to confirm)
 
@@ -209,5 +245,9 @@ permissions (same-uid only, which is the threat model of a dev tool);
   ≤10k lines per slot).
 - Override is a property of the current generation; `r` keeps it, `k` and
   self-exit drop it; a second `run` replaces it.
+- `all` is a slot argument, not a flag; partial success (some slots skipped)
+  is exit 0 with the skipped list in the reply.
+- `stop`/`start` exist as CLI verbs only; no hotkeys for them.
+- `quit` is in scope; `stop all` keeps the TUI running with every slot dead.
 - `logs --follow` deferred; agents poll with `--since`.
 - Status bar shows `*` for overrides and `CTRL`/`NO CTRL` for the socket.
