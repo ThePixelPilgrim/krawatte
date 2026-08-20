@@ -88,6 +88,12 @@ pub enum Event {
     },
     /// Watched paths of a slot changed; see [`Changed`].
     Changed(Changed),
+    /// A request from the control socket; answer on `reply`.
+    #[allow(dead_code)] // read by the main loop, a later task
+    Control {
+        request: crate::protocol::Request,
+        reply: std::sync::mpsc::Sender<crate::protocol::Response>,
+    },
 }
 
 /// A debounced batch of filesystem changes for one slot, sent by the watcher
@@ -129,7 +135,6 @@ pub enum Trigger {
     Watch { paths: Vec<PathBuf>, more: usize },
     /// A CLI verb over the control socket: `restart`, `kill`, `stop`,
     /// `start`, `run`.
-    #[allow(dead_code)] // constructed by the control handler, a later task
     Cli(String),
     /// An override exited on its own; the standard command resumes.
     Resume,

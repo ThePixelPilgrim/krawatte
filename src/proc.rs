@@ -73,7 +73,6 @@ pub enum GenKind {
 
 /// A point-in-time description of a slot, for `krawatte status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // read by the control handler, a later task
 pub struct SlotInfo {
     /// 1-based, as shown in the status bar.
     pub index: usize,
@@ -333,7 +332,6 @@ impl ProcManager {
 
     /// Tear down the current generation and leave the slot dead. The retired
     /// generation stays on the slot so its exit status is still reported.
-    #[allow(dead_code)] // called by the control handler, a later task
     pub fn stop(&mut self, proc: ProcId, trigger: Trigger) -> bool {
         self.begin(proc, None, GenKind::Standard, trigger)
     }
@@ -448,7 +446,6 @@ impl ProcManager {
     }
 
     /// Number of the slot's current generation.
-    #[allow(dead_code)] // test-only accessor
     pub fn current_gen(&self, proc: ProcId) -> Gen {
         self.procs[proc].r#gen
     }
@@ -466,7 +463,7 @@ impl ProcManager {
     }
 
     /// What kind of command the slot's current generation runs.
-    #[allow(dead_code)] // read by the control handler, a later task
+    #[allow(dead_code)] // test-only accessor
     pub fn kind(&self, proc: ProcId) -> GenKind {
         self.procs[proc].kind
     }
@@ -488,7 +485,6 @@ impl ProcManager {
     }
 
     /// Describe the slot as it is right now, for `krawatte status`.
-    #[allow(dead_code)] // read by the control handler, a later task
     pub fn snapshot(&self, proc: ProcId) -> SlotInfo {
         let p = &self.procs[proc];
         let alive = !self.is_dead(proc);

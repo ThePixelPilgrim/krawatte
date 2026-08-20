@@ -1,5 +1,4 @@
 //! The line-JSON protocol spoken over the control socket. Pure data.
-#![allow(dead_code)] // wired in by a later task
 
 use serde::{Deserialize, Serialize};
 

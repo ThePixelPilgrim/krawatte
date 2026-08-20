@@ -7,6 +7,7 @@
 
 mod buffer;
 mod config;
+mod control;
 mod marker;
 mod proc;
 mod protocol;
@@ -353,6 +354,7 @@ fn drain_events(
                     ui.set_health(changed.proc, Health::Restarting);
                 }
             }
+            Event::Control { .. } => {} // routed in a later task
         }
     }
 }

@@ -21,7 +21,6 @@ pub struct StyledLine {
     pub proc: ProcId,
     /// Generation of the slot that produced the line; markers carry the
     /// generation current when they were inserted.
-    #[allow(dead_code)] // read by the control handler, a later task
     pub r#gen: Gen,
     pub stream: StreamTag,
     pub seq: Seq,
@@ -30,7 +29,6 @@ pub struct StyledLine {
     pub at: SystemTime,
     /// The bytes as written (ANSI escapes intact), so a client asking for
     /// color gets exactly what the process emitted.
-    #[allow(dead_code)] // read by the control handler, a later task
     pub raw: Vec<u8>,
     /// ANSI-parsed styled content, owned (`'static`).
     pub content: TuiLine<'static>,
@@ -76,7 +74,6 @@ impl StyledLine {
     }
 
     /// The text without styling: the concatenated span contents.
-    #[allow(dead_code)] // read by the control handler, a later task
     pub fn plain(&self) -> String {
         self.content
             .spans
